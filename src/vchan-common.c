@@ -98,7 +98,27 @@ BOOL VchanSendBuffer(IN libvchan_t *vchan, IN const void *data, IN size_t size, 
         // wait for space
         LogWarning("(%p, %s): vchan buffer full, blocking write", vchan, what);
         while (VchanGetWriteBufferSize(vchan) < size)
+        {
+            // ONLY THE PEER FREES ROOM, SO A WAIT WITH NO PEER NEVER ENDS, and this loop had no
+            // escape at all. qrexec-wrapper added one for itself in VchanWaitForSendSpace, whose
+            // docstring says this function "never checks that the peer is still there", but its
+            // other guard is g_VchanClosing - a WRAPPER-LOCAL flag, absent from all of winutils -
+            // so agent/gui-agent/vchan.c and qrexec-agent.c inherited a spin with no exit of any
+            // kind, under the lock each of them holds across the send (g_DaemonCriticalSection,
+            // g_VchanCs), which stops the whole component and not just the send. Same check as the
+            // wrapper's, in the one place every caller shares.
+            // WHAT THIS DOES NOT CATCH, stated so nobody reads more into it: open() is ring->cli_live
+            // or ring->srv_live (pvdrivers libxenvchan io.c:526-529), and only an orderly
+            // libxenvchan_close writes 0, so a peer that was KILLED or wedged still reads CONNECTED.
+            // That is the 31/34 "peer still MARKED live" RINGPEER measured, and closing it needs the
+            // evtchn cross-check that upstream leaves #if 0 (core-vchan-xen io.c:152).
+            if (!libvchan_is_open(vchan))
+            {
+                LogWarning("the peer closed the vchan while %Iu bytes waited for room - not sent", size);
+                return FALSE;
+            }
             Sleep(1);
+        }
     }
 
     if ((writeSize = libvchan_send(vchan, data, size)) < 0)
