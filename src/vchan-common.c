@@ -120,7 +120,28 @@ BOOL VchanSendBuffer(IN libvchan_t *vchan, IN const void *data, IN size_t size, 
 
         // Fetched once, here rather than per iteration: it does not change for the life of the
         // vchan, and a NULL is an anomaly to report once, not every millisecond.
-        vchanEvent = libvchan_fd_for_select(vchan);
+        // OWN THE HANDLE WE WAIT ON. libvchan_fd_for_select hands back the vchan's OWN event handle
+        // and libvchan_close closes it, so waiting on the raw handle is undefined as soon as a close
+        // can run while a sender is parked here: the value gets recycled by the next CreateEvent and
+        // this wait then takes a wake belonging to an unrelated object. A duplicate keeps the kernel
+        // object alive for exactly as long as this call needs it, and SetEvent on the duplicate
+        // signals the SAME object, so the hand-back below still reaches the main loop waiting on the
+        // original. A failed duplicate degrades to the poll, like a NULL event. The mitigation is
+        // agent/gui-agent/vchan.c:220-234's, which carried it alone - while THIS, the helper every
+        // component shares, had the identical hazard and none of the guard.
+        // UNREACHABLE TODAY, AND THAT IS STATED RATHER THAN GLOSSED: every live caller reserves the
+        // whole message before it gets here - qrexec-wrapper's VchanWaitForSendSpace (:995),
+        // qrexec-agent's whole-frame wait (:339-475), gui-agent's VchanReserveLocked - so the only
+        // path into this wait is gui-agent's [FI_LEGACY_SEND] fault-injection branch (vchan.c:437,
+        // compiled to `return FALSE` in a release build by faultinject.h:236). So this fix is
+        // UNMEASURED BY CONSTRUCTION: there is no release-build stimulus that reaches it. It is here
+        // for the next caller that does not pre-reserve, not on the strength of a measurement.
+        {
+            HANDLE raw = libvchan_fd_for_select(vchan);
+            if (!raw || !DuplicateHandle(GetCurrentProcess(), raw, GetCurrentProcess(),
+                                         &vchanEvent, 0, FALSE, DUPLICATE_SAME_ACCESS))
+                vchanEvent = NULL;
+        }
         if (!vchanEvent)
             LogWarning("no vchan event to wait on, polling for room instead");
         // A `for (;;)` AND NOT A `while (room < size)`: that condition is ITSELF a ring read, so it
@@ -142,6 +163,12 @@ BOOL VchanSendBuffer(IN libvchan_t *vchan, IN const void *data, IN size_t size, 
                 LogInfo("QGAGOINGDOWN this component is tearing down while %Iu bytes waited for room - not sent", size);
                 if (consumedWake)
                     SetEvent(vchanEvent);
+                // The duplicate is ours on EVERY exit, including the two failures: closing it is
+                // what releases our reference to the kernel object. Leaking it would hold that
+                // object past the vchan it belongs to, and this is the teardown path, where the
+                // object is precisely what should be going away.
+                if (vchanEvent)
+                    CloseHandle(vchanEvent);
                 return FALSE;
             }
 
@@ -166,6 +193,8 @@ BOOL VchanSendBuffer(IN libvchan_t *vchan, IN const void *data, IN size_t size, 
                 LogWarning("the peer closed the vchan while %Iu bytes waited for room - not sent", size);
                 if (consumedWake)
                     SetEvent(vchanEvent);
+                if (vchanEvent)
+                    CloseHandle(vchanEvent);
                 return FALSE;
             }
 
@@ -178,12 +207,19 @@ BOOL VchanSendBuffer(IN libvchan_t *vchan, IN const void *data, IN size_t size, 
             // it reads the space (pvdrivers libxenvchan io.c:256-257), so the arming precedes the
             // observation and the peer's next consume fires this event.
             // THE RE-SIGNAL IS NOT OPTIONAL. This is the SAME auto-reset event the callers' own main
-            // loops wait on for INCOMING data - qrexec-wrapper.c:1803 and :2109, qrexec-agent.c:1369
-            // all pass libvchan_fd_for_select on this vchan - so a wake consumed here is a wake
-            // those loops never see, and a message would sit unread in the ring until some unrelated
-            // event woke them. Handing it back on every exit costs a spurious wake, which is already
-            // routine for them (the peer's read-notify produces them). agent/gui-agent/vchan.c
-            // carries this same consumedWake dance for the same reason.
+            // loops wait on for INCOMING data - qrexec-wrapper.c:1975 and :2311, qrexec-agent.c:1494,
+            // agent/gui-agent/main.c:15641 all pass libvchan_fd_for_select on this vchan - so a wake
+            // consumed here is a wake those loops never see, and a message would sit unread in the
+            // ring until some unrelated event woke them. Handing it back on every exit costs a
+            // spurious wake, which is already routine for them (the peer's read-notify produces
+            // them). agent/gui-agent/vchan.c carries this same consumedWake dance for the same reason.
+            // AND THE HAND-BACK IS WHY THIS IS A ONE-WAY LOSS, which is the defect the qrexec senders
+            // have since been moved off this event to escape: the reader never hands a wake back to a
+            // parked sender, so the loss runs toward the sender and costs it a whole slice. Measured
+            // on 2026-11-09 at 67-72% of stalls in qrexec, and fixed there by a DEDICATED auto-reset
+            // room event that only the reader waits on the vchan's event and relays from. This copy
+            // keeps the shared event because the only caller that reaches this wait is a fault
+            // injection whose purpose is to reproduce exactly this behaviour.
             // WHAT THIS DOES NOT CHANGE, said plainly: the caller's lock is still held across the
             // whole wait, so a peer that stops draining still stops the component. This removes the
             // spin, not that. Releasing the lock needs a reservation the ring protocol does not have.
@@ -212,6 +248,10 @@ BOOL VchanSendBuffer(IN libvchan_t *vchan, IN const void *data, IN size_t size, 
 
         if (consumedWake)
             SetEvent(vchanEvent);
+        // Closed BEFORE the send, not after it: nothing below this point waits on the event, and the
+        // send has three exits of its own that would each have to remember to close it.
+        if (vchanEvent)
+            CloseHandle(vchanEvent);
     }
 
     if ((writeSize = libvchan_send(vchan, data, size)) < 0)
