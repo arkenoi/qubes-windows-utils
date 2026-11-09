@@ -56,6 +56,16 @@ BOOL VchanSendBuffer(IN libvchan_t *vchan, IN const void *data, IN size_t size, 
 WINDOWSUTILS_API
 BOOL VchanReceiveBuffer(IN libvchan_t *vchan, OUT void *data, IN size_t size, IN const WCHAR *what);
 
+// A COMPONENT CALLS THIS BEFORE IT CLOSES ITS VCHAN. VchanSendBuffer's wait for ring room ends only
+// when the peer frees room or closes, and a peer that was killed or wedged still reads CONNECTED, so
+// a sender parked there holds its caller's lock across the close that is about to unmap that ring -
+// and the wait's own is_open check would then be reading freed memory. This makes such a sender give
+// up at once. Process-wide and ONE-WAY: nothing clears it, because a component that has begun tearing
+// down does not send again. qrexec-wrapper has its own equivalent (g_VchanClosing) and need not call
+// this; agent/gui-agent and qrexec-agent had no equivalent of any kind.
+WINDOWSUTILS_API
+void VchanBeginTeardown(void);
+
 #ifdef __cplusplus
 }
 #endif

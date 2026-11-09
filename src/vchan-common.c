@@ -86,6 +86,16 @@ int VchanGetWriteBufferSize(IN libvchan_t *vchan)
     return libvchan_buffer_space(vchan);
 }
 
+// Set by VchanBeginTeardown, tested by the wait in VchanSendBuffer below. One-way and process-wide:
+// the setter is the thread tearing the component down and the reader is a sender parked in that wait,
+// never the same thread, so the write is interlocked and the read is volatile.
+static volatile LONG g_VchanTearingDown = 0;
+
+void VchanBeginTeardown(void)
+{
+    InterlockedExchange(&g_VchanTearingDown, 1);
+}
+
 BOOL VchanSendBuffer(IN libvchan_t *vchan, IN const void *data, IN size_t size, IN const WCHAR *what)
 {
     int writeSize;
@@ -97,8 +107,29 @@ BOOL VchanSendBuffer(IN libvchan_t *vchan, IN const void *data, IN size_t size, 
     {
         // wait for space
         LogWarning("(%p, %s): vchan buffer full, blocking write", vchan, what);
-        while (VchanGetWriteBufferSize(vchan) < size)
+        // A `for (;;)` AND NOT A `while (room < size)`: that condition is ITSELF a ring read, so it
+        // would run before the teardown test on every iteration and the test could not be described as
+        // coming first. Here nothing touches the ring until the flag has been read.
+        for (;;)
         {
+            // WHAT THIS IS: LIVENESS. It is NOT what makes the close safe. Safety is the CALLER's lock:
+            // a component whose teardown closes under the same lock its senders hold (qrexec-agent's
+            // ServiceCleanup, agent/gui-agent/main.c) cannot have a close running concurrently with a
+            // sender parked here, because that sender holds the lock. What it CANNOT do without this
+            // flag is finish - so the teardown blocks on that lock forever, and ordering the close
+            // under the lock would merely trade a use-after-unmap for a service that never stops.
+            // The check below cannot serve instead: open() reads ring->cli_live / ring->srv_live and
+            // nobody writes 0 on our own side of a close we are about to perform. A teardown we asked
+            // for is not a fault, so INFO, not a warning.
+            if (g_VchanTearingDown)
+            {
+                LogInfo("QGAGOINGDOWN this component is tearing down while %Iu bytes waited for room - not sent", size);
+                return FALSE;
+            }
+
+            if (VchanGetWriteBufferSize(vchan) >= size)
+                break;
+
             // ONLY THE PEER FREES ROOM, SO A WAIT WITH NO PEER NEVER ENDS, and this loop had no
             // escape at all. qrexec-wrapper added one for itself in VchanWaitForSendSpace, whose
             // docstring says this function "never checks that the peer is still there", but its
