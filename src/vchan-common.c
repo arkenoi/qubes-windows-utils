@@ -96,9 +96,19 @@ void VchanBeginTeardown(void)
     InterlockedExchange(&g_VchanTearingDown, 1);
 }
 
+// Longest the wait below sleeps before it re-reads its exit conditions. It is NOT a deadline and
+// nothing here gives up when it expires: the wait still ends only when room appears, when the peer
+// closes, or when this component tears down. The slice exists because a peer that dies without
+// firing the channel never fires it again, so the per-slice re-check is what notices that; a wake
+// that fails to arrive costs one slice. Same value and same reasoning as
+// agent/gui-agent/vchan.c's VCHAN_RESERVE_WAIT_SLICE_MS, which is where this idiom is proven.
+#define VCHAN_SEND_WAIT_SLICE_MS 100
+
 BOOL VchanSendBuffer(IN libvchan_t *vchan, IN const void *data, IN size_t size, IN const WCHAR *what)
 {
     int writeSize;
+    HANDLE vchanEvent = NULL;
+    BOOL consumedWake = FALSE;
 
     LogVerbose("(%p, %s): %d bytes (free: %d)", vchan, what, size, VchanGetWriteBufferSize(vchan));
     //hex_dump(what, data, size);
@@ -107,6 +117,12 @@ BOOL VchanSendBuffer(IN libvchan_t *vchan, IN const void *data, IN size_t size, 
     {
         // wait for space
         LogWarning("(%p, %s): vchan buffer full, blocking write", vchan, what);
+
+        // Fetched once, here rather than per iteration: it does not change for the life of the
+        // vchan, and a NULL is an anomaly to report once, not every millisecond.
+        vchanEvent = libvchan_fd_for_select(vchan);
+        if (!vchanEvent)
+            LogWarning("no vchan event to wait on, polling for room instead");
         // A `for (;;)` AND NOT A `while (room < size)`: that condition is ITSELF a ring read, so it
         // would run before the teardown test on every iteration and the test could not be described as
         // coming first. Here nothing touches the ring until the flag has been read.
@@ -124,6 +140,8 @@ BOOL VchanSendBuffer(IN libvchan_t *vchan, IN const void *data, IN size_t size, 
             if (g_VchanTearingDown)
             {
                 LogInfo("QGAGOINGDOWN this component is tearing down while %Iu bytes waited for room - not sent", size);
+                if (consumedWake)
+                    SetEvent(vchanEvent);
                 return FALSE;
             }
 
@@ -146,10 +164,45 @@ BOOL VchanSendBuffer(IN libvchan_t *vchan, IN const void *data, IN size_t size, 
             if (!libvchan_is_open(vchan))
             {
                 LogWarning("the peer closed the vchan while %Iu bytes waited for room - not sent", size);
+                if (consumedWake)
+                    SetEvent(vchanEvent);
                 return FALSE;
             }
-            Sleep(1);
+
+            // WAIT ON THE CHANNEL, DO NOT SPIN. This was Sleep(1): a 1 kHz timer-resolution spin,
+            // run by a thread that is HOLDING the component's lock, for as long as the peer takes to
+            // drain. That is self-inflicted guest load in precisely the window the stall is recorded
+            // in, and findings records self-inflicted load as a confounder in its own right.
+            // libvchan already has the trigger and no wake can be lost: VchanGetWriteBufferSize
+            // above is libvchan_buffer_space, which calls request_notify(VCHAN_NOTIFY_READ) BEFORE
+            // it reads the space (pvdrivers libxenvchan io.c:256-257), so the arming precedes the
+            // observation and the peer's next consume fires this event.
+            // THE RE-SIGNAL IS NOT OPTIONAL. This is the SAME auto-reset event the callers' own main
+            // loops wait on for INCOMING data - qrexec-wrapper.c:1803 and :2109, qrexec-agent.c:1369
+            // all pass libvchan_fd_for_select on this vchan - so a wake consumed here is a wake
+            // those loops never see, and a message would sit unread in the ring until some unrelated
+            // event woke them. Handing it back on every exit costs a spurious wake, which is already
+            // routine for them (the peer's read-notify produces them). agent/gui-agent/vchan.c
+            // carries this same consumedWake dance for the same reason.
+            // WHAT THIS DOES NOT CHANGE, said plainly: the caller's lock is still held across the
+            // whole wait, so a peer that stops draining still stops the component. This removes the
+            // spin, not that. Releasing the lock needs a reservation the ring protocol does not have.
+            if (vchanEvent)
+            {
+                if (WaitForSingleObject(vchanEvent, VCHAN_SEND_WAIT_SLICE_MS) == WAIT_OBJECT_0)
+                    consumedWake = TRUE;
+            }
+            else
+            {
+                // No event for this vchan at all (warned once before the loop): poll rather than
+                // busy-loop with no delay. This is the pre-2026-11-09 behaviour, kept only as the
+                // fallback it always should have been.
+                Sleep(1);
+            }
         }
+
+        if (consumedWake)
+            SetEvent(vchanEvent);
     }
 
     if ((writeSize = libvchan_send(vchan, data, size)) < 0)
