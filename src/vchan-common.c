@@ -189,8 +189,17 @@ BOOL VchanSendBuffer(IN libvchan_t *vchan, IN const void *data, IN size_t size, 
             // spin, not that. Releasing the lock needs a reservation the ring protocol does not have.
             if (vchanEvent)
             {
-                if (WaitForSingleObject(vchanEvent, VCHAN_SEND_WAIT_SLICE_MS) == WAIT_OBJECT_0)
+                DWORD w = WaitForSingleObject(vchanEvent, VCHAN_SEND_WAIT_SLICE_MS);
+                if (w == WAIT_OBJECT_0)
                     consumedWake = TRUE;
+                else if (w != WAIT_TIMEOUT)
+                {
+                    // A failed wait returns at once, so without this the loop spins at full speed.
+                    // The guard is agent/gui-agent/vchan.c:305-307's - the site the comment above
+                    // cites as proven, which this copy and both qrexec ones took the shape of
+                    // without it.
+                    Sleep(VCHAN_SEND_WAIT_SLICE_MS);
+                }
             }
             else
             {
