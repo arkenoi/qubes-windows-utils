@@ -729,7 +729,18 @@ static void QpsDisconnectClientInternal(
 
     if (!client)
     {
-        LogWarning("[%lld] not connected", ClientId);
+        // INFO, NOT A WARNING: this is a redundant disconnect, and nothing is wrong. At service stop
+        // QpsDestroy disconnects every client from the main thread; a client's own per-client thread
+        // then gets 109 from QpsRead and asks to disconnect it again, and the lookup answers NULL.
+        // Client ids come from InterlockedIncrement64 and are never reused, so NULL can only mean
+        // "already gone". When the other thread wins the same race, the Disconnecting branch below
+        // returns silently, so the level used to depend only on which thread won. MEASURED
+        // 2026-11-11 (acceptance of build 4.3.41.1270, win10-reinstall, qubesdb-daemon, one clock):
+        // main thread disconnects client 9, 15 ms later the client's thread fails QpsRead with 109
+        // and asks again -> this line -> QPSDESTROYED. Until 2026-10-26 the same sequence crashed the
+        // daemon (QDBSTOPUAF); this return is that fix's designed answer. Owner, 2026-11-11:
+        // "demote, too".
+        LogInfo("[%lld] not connected", ClientId);
         return;
     }
 
