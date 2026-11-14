@@ -272,6 +272,10 @@ static PPIPE_CLIENT QpsGetClientRaw(
         if (client->Id == ClientId)
         {
             returnClient = client;
+            // The reference is taken under the list lock. The last release unlinks and frees the
+            // client under this same lock, so it cannot happen between the find and the count.
+            if (IncreaseRefcount)
+                InterlockedIncrement(&returnClient->RefCount);
             break;
         }
 
@@ -281,8 +285,6 @@ static PPIPE_CLIENT QpsGetClientRaw(
 
     if (returnClient)
     {
-        if (IncreaseRefcount)
-            InterlockedIncrement(&returnClient->RefCount);
         LogVerbose("[%lld] (%p) refs: %ld", returnClient->Id, returnClient, returnClient->RefCount);
     }
     else
@@ -399,8 +401,39 @@ static DWORD WINAPI QpsReaderThread(
     while (TRUE)
     {
         LogVerbose("[%lld] reading...", client->Id);
-        // reading will fail even if blocked when we call CancelIo() from QpsDisconnectClient
-        if (!ReadFile(pipe, buffer, server->PipeBufferSize, &transferred, NULL)) // this can block
+
+        // Only as many bytes as the read buffer has room for are taken from the pipe. The rest
+        // stay in the pipe, where they hold back the peer's next write until they are read, so
+        // nothing is thrown away for arriving faster than the host reads. While the buffer is
+        // full this thread looks again every 10 ms for QpsRead to have made room, for as long
+        // as the host takes: a client is dropped by a disconnect, not by a clock.
+        UINT64 room = 0;
+        for (;;)
+        {
+            EnterCriticalSection(&client->Lock);
+            room = CmqGetFreeSize(client->ReadBuffer);
+            LeaveCriticalSection(&client->Lock);
+            if (room > 0 || client->Disconnecting)
+                break;
+            Sleep(10);
+        }
+
+        // No read is started once a disconnect is under way.
+        if (client->Disconnecting)
+        {
+            LogDebug("[%lld] client is disconnecting, exiting", client->Id);
+            QpsReleaseClient(server, client);
+            QpsDisconnectClientInternal(server, param->ClientId, FALSE, TRUE);
+            free(param);
+            free(buffer);
+            return 1;
+        }
+
+        if (room > server->PipeBufferSize)
+            room = server->PipeBufferSize;
+
+        // A blocked read fails when QpsDisconnectClientInternal cancels the I/O on this handle.
+        if (!ReadFile(pipe, buffer, (DWORD)room, &transferred, NULL)) // this can block
         {
             // WHY THE READ ENDED, instead of one warning for every reason. This pipe protocol has
             // no goodbye message - EOF IS the disconnect (qdb_close just closes the handles, and
@@ -443,7 +476,8 @@ static DWORD WINAPI QpsReaderThread(
 
         if (!CmqAddData(client->ReadBuffer, buffer, transferred))
         {
-            // FIXME: block here until there's space
+            // Not reached while the read above asks for no more than the room it found: only this
+            // thread adds to the read buffer, so that room cannot shrink before the add.
             LeaveCriticalSection(&client->Lock);
             LogError("[%lld] read buffer full", client->Id);
             QpsReleaseClient(server, client);
@@ -521,7 +555,7 @@ static DWORD WINAPI QpsWriterThread(
             LeaveCriticalSection(&client->Lock);
 
             LogVerbose("[%lld] writing %lu 0x%lx", client->Id, size, size);
-            // writing will fail even if blocked when we call CancelIo() from QpsDisconnectClient
+            // A blocked write fails when QpsDisconnectClientInternal cancels the I/O on this handle.
             if (!QioWriteBuffer(pipe, data, (DWORD)size)) // this can block
             {
                 // win_perror("QioWriteBuffer");
@@ -575,12 +609,23 @@ static DWORD QpsConnectClient(
     PPIPE_CLIENT client;
     DWORD status;
 
+    // The two pipes are this function's from the moment it is called. Every return that does not
+    // publish the client closes them, because the accept loop does not.
     if (!Server->AcceptConnections)
+    {
+        CloseHandle(WritePipe);
+        CloseHandle(ReadPipe);
         return ERROR_SHUTDOWN_IN_PROGRESS;
+    }
 
     client = malloc(sizeof(PIPE_CLIENT));
     if (!client)
+    {
+        LogError("no memory");
+        CloseHandle(WritePipe);
+        CloseHandle(ReadPipe);
         return ERROR_NOT_ENOUGH_MEMORY;
+    }
 
     ZeroMemory(client, sizeof(PIPE_CLIENT));
     client->Id = ClientId;
@@ -613,6 +658,17 @@ static DWORD QpsConnectClient(
         goto fail;
     }
 
+    // ONE LOAD of the callback pointer; the local copy is what is tested and called from here on.
+    // The test and the call run outside Server->Lock, so a second load could return a pointer
+    // that another thread has cleared since the test.
+    const QPS_CLIENT_CONNECTED connectCallback = Server->ConnectCallback;
+
+    // THE HOST'S REFERENCE EXISTS BEFORE THE CLIENT CAN BE FOUND. A worker thread that runs to
+    // its end as soon as it is resumed gives back only its own reference, so the client stays
+    // valid for the rest of this function and until the host calls QpsDisconnectClient.
+    if (connectCallback)
+        client->RefCount = 1;
+
     // PUBLISH. After this the client is findable, so the threads may run - and from here on the
     // client belongs to the server: it is torn down by QpsDisconnectClient/QpsReleaseClient, never
     // by this function.
@@ -632,30 +688,19 @@ static DWORD QpsConnectClient(
         win_perror("ResumeThread");
         LogError("[%lld] worker threads could not be resumed; disconnecting", ClientId);
         QpsDisconnectClientInternal(Server, ClientId, FALSE, FALSE);
+        // The host is never told about this client, so its reference is given back here.
+        if (connectCallback)
+            QpsReleaseClient(Server, client);
         return ERROR_NO_SYSTEM_RESOURCES;
     }
 
-    // SINGLE LOAD, THEN CALL THE LOCAL COPY - the field must not be re-read between the guard
-    // and the call. Both the test and the call run OUTSIDE Server->Lock, which
-    // LeaveCriticalSection released above, and the InterlockedIncrement between them forces the
-    // compiler to reload the field. MEASURED in the shipped windows-utils.dll of package
-    // 4.3.39+agent.1f7216b11d1e, at 0x180005c30:
-    //     cmp  QWORD PTR [rsi+0x270],rbx   ; rbx is 0 (xor ebx,ebx at 0x180005b45) - the NULL test
-    //     je   skip
-    //     lock inc DWORD PTR [rdi+0x78]    ; the InterlockedIncrement below
-    //     mov  rax,QWORD PTR [rsi+0x270]   ; RELOAD of the same field
-    //     call rax                         ; called without re-testing
-    // A thread clearing ConnectCallback (QpsDestroy) between the test and the reload turns this
-    // into `call 0` - exactly c0000005 "execute of 0000000000000000", p0=8 p1=0.
-    const QPS_CLIENT_CONNECTED connectCallback = Server->ConnectCallback;
     if (connectCallback)
     {
-        // Increase the refcount if the connect callback is registered (pretty much always).
-        // Our host (application that registered the callback) will need to call
-        // QpsDisconnectClient after it's done interacting with the client
-        // (this will decrease the refcount and allow for client data cleanup).
-        InterlockedIncrement(&client->RefCount);
-        connectCallback(Server, client->Id, Server->UserContext);
+        // The reference taken before the publish is the host's from here on. The host (the
+        // application that registered the callback) calls QpsDisconnectClient when it is done
+        // with the client; that gives the reference back and lets the client's data be freed.
+        // The host may do so from inside the callback, so the client is not touched after it.
+        connectCallback(Server, ClientId, Server->UserContext);
     }
 
     return ERROR_SUCCESS;
@@ -686,8 +731,8 @@ fail:
     DeleteCriticalSection(&client->Lock);
     free(client);
     // THE PIPES, WHICH NOBODY ELSE WILL CLOSE: the accept loop creates them and hands them in, and
-    // on failure its caller does `if (status != ERROR_SUCCESS) return status;` without touching
-    // them. On success they belong to the client and QpsDisconnectClientInternal closes them, so
+    // on failure its caller goes on to the next client without touching them. On success they
+    // belong to the client and QpsDisconnectClientInternal closes them, so
     // this function owns them in both outcomes or a handle pair leaks per failure.
     if (WritePipe)
         CloseHandle(WritePipe);
@@ -744,13 +789,14 @@ static void QpsDisconnectClientInternal(
         return;
     }
 
-    if (client->Disconnecting)
+    // Test and set in one step: of two threads that disconnect the same client, exactly one goes
+    // on to the teardown below and the other returns here.
+    if (InterlockedExchange((LONG *)&client->Disconnecting, TRUE))
     {
         QpsReleaseClient(Server, client);
         return;
     }
 
-    client->Disconnecting = TRUE;
     LogInfo("[%lld] (%p) disconnecting, WriterExiting %d, ReaderExiting %d", ClientId, client, WriterExiting, ReaderExiting);
 
     if (!WriterExiting)
@@ -759,7 +805,9 @@ static void QpsDisconnectClientInternal(
         if (WaitForSingleObject(client->WriterThread, Server->WriteTimeout) != WAIT_OBJECT_0)
         {
             LogWarning("[%lld] writer thread didn't terminate in time, canceling write", ClientId);
-            if (!CancelIo(client->WritePipe)) // this will abort a blocking operation
+            // The write belongs to the writer thread, so it is cancelled by handle and not by
+            // calling thread. Nothing to cancel is not an error: the writer is between two writes.
+            if (!CancelIoEx(client->WritePipe, NULL) && GetLastError() != ERROR_NOT_FOUND) // this will abort a blocking operation
                 win_perror("CancelIo(write)");
         }
 
@@ -781,7 +829,11 @@ static void QpsDisconnectClientInternal(
     {
         // wait for the reader thread to exit
         LogVerbose("[%lld] (%p) canceling read", ClientId, client);
-        if (!CancelIo(client->ReadPipe)) // this will abort a blocking operation
+        // The read belongs to the reader thread, so it is cancelled by handle and not by calling
+        // thread. Nothing to cancel is not an error: the reader is between two reads. It starts
+        // no new one once it has seen the disconnect; one that looked just before the flag was
+        // set still starts a read after this cancel, and the wait and the kill below end it.
+        if (!CancelIoEx(client->ReadPipe, NULL) && GetLastError() != ERROR_NOT_FOUND) // this will abort a blocking operation
             win_perror("CancelIo(read)");
 
         if (WaitForSingleObject(client->ReaderThread, 100) != WAIT_OBJECT_0)
@@ -855,11 +907,19 @@ DWORD QpsMainLoop(
                                     0,
                                     Server->SecurityAttributes);
 
+        // Without this instance there is nothing to accept on, and a connect on an invalid handle
+        // fails every time it is tried.
+        if (writePipe == INVALID_HANDLE_VALUE)
+            return win_perror("CreateNamedPipe(outbound)");
+
         // wait for connection
         do
         {
             LogVerbose("waiting for outbound connection, pipe %s", Server->PipeName);
-            connected = ConnectNamedPipe(writePipe, NULL) ? TRUE : (GetLastError() == ERROR_PIPE_CONNECTED);
+            // A client that has opened this instance and closed it again already has connected
+            // too (ERROR_NO_DATA). It is dropped below, by the first step that fails for it, and
+            // the loop goes on; waiting here for the same instance again would never end.
+            connected = ConnectNamedPipe(writePipe, NULL) ? TRUE : (GetLastError() == ERROR_PIPE_CONNECTED || GetLastError() == ERROR_NO_DATA);
             if (!connected)
                 Sleep(10);
         } while (!connected);
@@ -868,7 +928,10 @@ DWORD QpsMainLoop(
         // prepare the read pipe
         if (!GetNamedPipeClientProcessId(writePipe, &pid))
         {
-            return win_perror("GetNamedPipeClientProcessId");
+            // An error on one client ends that client only; the loop goes on to the next one.
+            win_perror("GetNamedPipeClientProcessId");
+            CloseHandle(writePipe);
+            continue;
         }
 
         clientId = QpsAllocateClientId(Server);
@@ -883,16 +946,29 @@ DWORD QpsMainLoop(
                                    0,
                                    Server->SecurityAttributes);
 
+        if (readPipe == INVALID_HANDLE_VALUE)
+        {
+            win_perror("CreateNamedPipe(inbound)");
+            CloseHandle(writePipe);
+            continue;
+        }
+
         // send the name to the client
         cbPipeName = (DWORD) (wcslen(pipeName) + 1) * sizeof(WCHAR);
         if (!WriteFile(writePipe, &cbPipeName, sizeof(cbPipeName), &written, NULL))
         {
-            return win_perror("writing size of inbound pipe name");
+            win_perror("writing size of inbound pipe name");
+            CloseHandle(readPipe);
+            CloseHandle(writePipe);
+            continue;
         }
 
         if (!WriteFile(writePipe, pipeName, cbPipeName, &written, NULL))
         {
-            return win_perror("writing name of inbound pipe");
+            win_perror("writing name of inbound pipe");
+            CloseHandle(readPipe);
+            CloseHandle(writePipe);
+            continue;
         }
 
         // FIXME: this blocks forever if the client never connects here
@@ -900,7 +976,10 @@ DWORD QpsMainLoop(
         do
         {
             LogVerbose("waiting for inbound connection, pipe %s", pipeName);
-            connected = ConnectNamedPipe(readPipe, NULL) ? TRUE : (GetLastError() == ERROR_PIPE_CONNECTED);
+            // A client that has written its request and closed already (ERROR_NO_DATA) is as
+            // connected as one that is still there: what it wrote stays in the pipe for the
+            // reader thread. Waiting here for the same instance again would never end.
+            connected = ConnectNamedPipe(readPipe, NULL) ? TRUE : (GetLastError() == ERROR_PIPE_CONNECTED || GetLastError() == ERROR_NO_DATA);
             if (!connected)
                 Sleep(10);
         } while (!connected);
@@ -908,7 +987,9 @@ DWORD QpsMainLoop(
 
         // initialize the client
         status = QpsConnectClient(Server, clientId, writePipe, readPipe);
-        if (status != ERROR_SUCCESS)
+        // A failure to set one client up has released that client's pipes and ends that client
+        // only. The loop itself ends when the server is being destroyed.
+        if (status == ERROR_SHUTDOWN_IN_PROGRESS)
             return status;
     }
 }
@@ -921,40 +1002,37 @@ DWORD QpsRead(
     )
 {
     UINT64 size;
-    UINT64 pending = 0;
-    BOOL ret;
+    DWORD received = 0;
+    BOOL disconnecting;
     PPIPE_CLIENT client = QpsGetClient(Server, ClientId);
 
     LogVerbose("[%lld] size %lu", ClientId, DataSize);
     if (!client)
         return ERROR_NOT_CONNECTED;
 
-    // get data from the read buffer until the requested amount is read
-    do
+    // Take what the read buffer holds, piece by piece, until the requested amount has arrived.
+    // The reader thread refills the buffer as it empties, so a request may be larger than the
+    // buffer.
+    while (received < DataSize)
     {
-        // get data from the read buffer if available
-        size = DataSize;
-        EnterCriticalSection(&client->Lock);
-        ret = CmqGetData(client->ReadBuffer, Data, &size, CMQ_NO_UNDERFLOW);
-        // HOW MUCH IS ACTUALLY BUFFERED, read under the SAME lock that guarded the get above, and
-        // that is the whole point. This used to be read after LeaveCriticalSection, racing the
-        // reader thread that appends to this very buffer - so the two observations described
-        // different instants and could not both be true.
-        // MEASURED 2026-10-26, acceptance run 40297264818 cell win10-upgrade, qrexec-agent
-        // 4.3.37.1123: "QpsRead: [3] peer gone mid-message: 426 of 0 bytes" on the magic read,
-        // which is QpsRead(&magic, sizeof(UINT32)) - FOUR bytes (qrexec-agent.c:1478). CmqGetData
-        // with CMQ_NO_UNDERFLOW can only fail if fewer than 4 bytes are buffered, so "426 pending"
-        // and "a 4-byte read underflowed" cannot both describe one instant. The unlocked read saw
-        // the reader thread's append land afterwards and reported it as evidence of a truncated
-        // message. An ERROR that convicts the product has to be coherent first.
-        pending = CmqGetUsedSize(client->ReadBuffer);
-        LeaveCriticalSection(&client->Lock);
+        // The flag is sampled BEFORE the buffer is looked at. A reader thread that finds the peer
+        // gone has added everything it read before it sets the flag, so a flag already set here
+        // means the look below sees all this client delivered. A flag that is set after the look
+        // is acted on in the next pass, after another look.
+        disconnecting = client->Disconnecting;
 
-        if (!ret)
+        // Never zero inside this loop, and it must not be: zero asks CmqGetData for everything.
+        size = DataSize - received;
+        EnterCriticalSection(&client->Lock);
+        CmqGetData(client->ReadBuffer, (BYTE *)Data + received, &size, CMQ_ALLOW_UNDERFLOW);
+        LeaveCriticalSection(&client->Lock);
+        received += (DWORD)size;
+
+        if (received < DataSize)
         {
             // If there's not enough data and the client is disconnecting,
             // that means we'll never have enough data: abort.
-            if (client->Disconnecting)
+            if (disconnecting)
             {
                 // HOW MUCH WAS PENDING decides what this is. Nothing pending = the consumer was
                 // between messages and the peer is gone: the ordinary end of a session. Some but
@@ -964,20 +1042,17 @@ DWORD QpsRead(
                 // the case that matters. The ERROR_BROKEN_PIPE return is unchanged either way, so
                 // no caller's control flow moves.
                 QpsReleaseClient(Server, client);
-                if (pending == 0)
+                if (received == 0)
                     LogDebug("[%lld] peer gone, nothing pending", ClientId);
                 else
-                    // DataSize, NOT `size`: CmqGetData sets *dataSize = 0 on EVERY failure path before
-                    // returning FALSE (buffer.c, the underflow and empty-buffer branches), so `size`
-                    // is always 0 here and "of 0 bytes" was a destroyed argument, never a measurement.
-                    // DataSize is the IN parameter and is never written.
-                    LogError("[%lld] peer gone mid-message: %llu of %lu bytes", ClientId, pending, DataSize);
+                    // The two counts are what this call took and what it was asked for.
+                    LogError("[%lld] peer gone mid-message: %llu of %lu bytes", ClientId, (UINT64)received, DataSize);
                 return ERROR_BROKEN_PIPE;
             }
 
             Sleep(1); // don't congest the lock
         }
-    } while (!ret);
+    }
 
     QpsReleaseClient(Server, client);
     return ERROR_SUCCESS;
@@ -1145,25 +1220,24 @@ DWORD QpsConnect(
     }
     writePipeName[cbWritePipeName/2] = L'0';
 
-    // Try to open the write pipe; wait for it, if necessary.
-    do
-    {
-        LogDebug("opening write pipe: %s", writePipeName);
-        *WritePipe = CreateFile(writePipeName,
-                                GENERIC_WRITE, // this is an outbound pipe
-                                0,
-                                NULL,
-                                OPEN_EXISTING,
-                                0,
-                                NULL);
+    // Open the write pipe. The server creates it before it sends its name, so a pipe that is not
+    // found will not appear later: the server has given this client up or has gone away. The
+    // open is made once and its failure is the answer.
+    LogDebug("opening write pipe: %s", writePipeName);
+    *WritePipe = CreateFile(writePipeName,
+                            GENERIC_WRITE, // this is an outbound pipe
+                            0,
+                            NULL,
+                            OPEN_EXISTING,
+                            0,
+                            NULL);
 
-        // This pipe may be not created yet
-        status = GetLastError();
-        if ((*WritePipe == INVALID_HANDLE_VALUE) && (ERROR_FILE_NOT_FOUND != status))
-            return win_perror2(status, "open write pipe");
+    status = GetLastError();
+    if (*WritePipe == INVALID_HANDLE_VALUE)
+        return win_perror2(status, "open write pipe");
 
-        Sleep(10);
-    } while (*WritePipe == INVALID_HANDLE_VALUE);
+    // The server gets 10 ms to see this connection before the caller's first write.
+    Sleep(10);
 
     return ERROR_SUCCESS;
 }

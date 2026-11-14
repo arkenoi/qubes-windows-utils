@@ -503,10 +503,10 @@ void LogStart(IN const WCHAR *logfilePath OPTIONAL)
             }
             else if (GetLastError() == ERROR_FILE_EXISTS || GetLastError() == ERROR_ALREADY_EXISTS)
             {
-                // Somebody else owns the BOM; we only append after it. DECLARED, not handled: a
-                // delete between the failed CREATE_NEW and this open drops THIS process to stderr
-                // for its lifetime - only the age-based purge deletes here, so it needs a
-                // retention near zero, and the next process recreates the file.
+                // Somebody else owns the BOM; we only append after it. A delete between the failed
+                // CREATE_NEW and this open makes this open fail as well, and the per-process
+                // fallback below then gives this process a file of its own - only the age-based
+                // purge deletes here, so it needs a retention near zero.
                 g_LogfileHandle = CreateFile(
                     logfilePath,
                     FILE_APPEND_DATA | FILE_READ_ATTRIBUTES,
@@ -674,8 +674,9 @@ static void _LogFormatUnlocked(IN int level, IN BOOL raw, IN const char *functio
             GetCurrentProcessId(), GetCurrentThreadId(), g_LogLevelChar[level], functionName);
     }
 
-    // format buffer
-    bufferSize = vswprintf_s(g_Buffer, LOG_MAX_MESSAGE_LENGTH, format, args) * sizeof(WCHAR);
+    // Format the message. One that does not fit the buffer is cut to what fits: without
+    // _TRUNCATE the formatter treats it as an invalid parameter, which ends the process.
+    _vsnwprintf_s(g_Buffer, LOG_MAX_MESSAGE_LENGTH, _TRUNCATE, format, args);
 
     if (!raw)
     {
