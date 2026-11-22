@@ -198,6 +198,33 @@ static void WINAPI SvcMain(DWORD argc, WCHAR *argv[])
         return;
     }
 
+    // ONE CPU FOR THE SERVICE'S CHANNEL WORK, the same lowest-CPU mask qrexec-agent pins itself to
+    // (QREXECPIN, qrexec-agent.c). Stock xenbus's bucket lock wedges when two users of one bucket run
+    // on two CPUs; the guest dispatches every event channel we open on that CPU, so a service whose
+    // channel opens, closes, maps and unmaps run anywhere else is the second CPU. qubesdb-daemon is
+    // the one service this reaches that was not already pinned (qrexec-agent pins itself before it
+    // calls SvcMainLoop, so for it this changes nothing and logs nothing).
+    {
+        DWORD_PTR procMask = 0, sysMask = 0;
+        if (GetProcessAffinityMask(GetCurrentProcess(), &procMask, &sysMask) && sysMask)
+        {
+            DWORD_PTR one = sysMask & (~sysMask + 1); // the lowest CPU the system has
+            if (procMask != one)
+            {
+                if (SetProcessAffinityMask(GetCurrentProcess(), one))
+                    LogInfo("SVCPIN service '%s' pinned to CPU mask 0x%Ix (system 0x%Ix)", g_Service->Name, one, sysMask);
+                else
+                    LogWarning("SVCPIN service '%s' could not be pinned to one CPU (error 0x%x) - running UNPINNED",
+                        g_Service->Name, GetLastError());
+            }
+        }
+        else
+        {
+            LogWarning("SVCPIN service '%s' could not read the affinity masks (error 0x%x) - running UNPINNED",
+                g_Service->Name, GetLastError());
+        }
+    }
+
     g_Service->WorkerContext.StopEvent = g_Service->StopEvent;
     g_Service->WorkerThread = CreateThread(NULL, 0, g_Service->WorkerFunction, &g_Service->WorkerContext, 0, NULL);
     if (!g_Service->WorkerThread)
