@@ -835,8 +835,11 @@ static void QpsDisconnectClientInternal(
 // Get-QubesVmClass. And any failed step of that inline handshake RETURNED from QpsMainLoop, ending the server
 // (qubesdb-daemon exits when its pipe thread does) because of one client.
 // Now each handshake runs here. The client's process exit releases it, with no clock: a one-shot thread-pool wait
-// on the process marks the client gone and opens the inbound pipe itself, which completes the ConnectNamedPipe below
-// whether it is already waiting or not yet called (then it reports ERROR_PIPE_CONNECTED or ERROR_NO_DATA).
+// on the process opens the inbound pipe itself, which completes the ConnectNamedPipe below whether it is already
+// waiting or not yet called (then it reports ERROR_PIPE_CONNECTED or ERROR_NO_DATA). The client counts as gone only
+// when THAT open succeeded: a client that opened its inbound pipe itself holds the one instance, the release's open
+// then fails (ERROR_PIPE_BUSY), and the client is served - what it wrote before it exited is still read, as before.
+// A client that left during the handshake is one warning line; any other failed step is one error line.
 typedef struct _QPS_HANDSHAKE
 {
     PIPE_SERVER Server;
@@ -851,23 +854,27 @@ static VOID CALLBACK QpsHandshakeClientExited(PVOID context, BOOLEAN timedOut)
     QPS_HANDSHAKE* hs = (QPS_HANDSHAKE*)context;
     HANDLE pipe;
     UNREFERENCED_PARAMETER(timedOut);
-    InterlockedExchange(&hs->ClientGone, 1);
     pipe = CreateFile(hs->PipeName, GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
     if (pipe != INVALID_HANDLE_VALUE)
+    {
+        InterlockedExchange(&hs->ClientGone, 1);
         CloseHandle(pipe);
+    }
 }
 
 static DWORD WINAPI QpsHandshakeThread(PVOID param)
 {
     QPS_HANDSHAKE* hs = (QPS_HANDSHAKE*)param;
     HANDLE readPipe = INVALID_HANDLE_VALUE, process = NULL, wait = NULL;
-    DWORD status = ERROR_SUCCESS, cbPipeName, written, err;
+    DWORD status = ERROR_SUCCESS, cbPipeName, written;
+    const WCHAR* step = L"";
     ULONG pid = 0;
-    BOOL connected;
+    BOOL connected, left = FALSE;
 
     if (!GetNamedPipeClientProcessId(hs->WritePipe, &pid))
     {
-        status = win_perror("GetNamedPipeClientProcessId");
+        status = GetLastError();
+        step = L"GetNamedPipeClientProcessId";
         goto fail;
     }
     hs->ClientId = QpsAllocateClientId(hs->Server);
@@ -882,20 +889,25 @@ static DWORD WINAPI QpsHandshakeThread(PVOID param)
                                hs->Server->SecurityAttributes);
     if (readPipe == INVALID_HANDLE_VALUE)
     {
-        status = win_perror("CreateNamedPipe(inbound)");
+        status = GetLastError();
+        step = L"CreateNamedPipe(inbound)";
         goto fail;
     }
     // Before the name is sent: from here the client's exit always releases the wait below.
     process = OpenProcess(SYNCHRONIZE, FALSE, pid);
     if (!process)
     {
-        status = win_perror("OpenProcess(pipe client)");   // the client is already gone
-        goto fail;
+        status = GetLastError();
+        step = L"OpenProcess(pipe client)";
+        // ERROR_INVALID_PARAMETER: no process with that id - the client has already exited.
+        left = status == ERROR_INVALID_PARAMETER;
+        goto fail_logged;
     }
     if (!RegisterWaitForSingleObject(&wait, process, QpsHandshakeClientExited, hs, INFINITE, WT_EXECUTEONLYONCE))
     {
         wait = NULL;
-        status = win_perror("RegisterWaitForSingleObject(pipe client)");
+        status = GetLastError();
+        step = L"RegisterWaitForSingleObject(pipe client)";
         goto fail;
     }
 
@@ -903,27 +915,27 @@ static DWORD WINAPI QpsHandshakeThread(PVOID param)
     if (!WriteFile(hs->WritePipe, &cbPipeName, sizeof(cbPipeName), &written, NULL) ||
         !WriteFile(hs->WritePipe, hs->PipeName, cbPipeName, &written, NULL))
     {
-        status = win_perror("writing the inbound pipe name");
+        status = GetLastError();
+        step = L"writing the inbound pipe name";
         goto fail;
     }
 
     LogVerbose("[%lld] waiting for inbound connection, pipe %s", hs->ClientId, hs->PipeName);
     connected = ConnectNamedPipe(readPipe, NULL);
-    err = connected ? ERROR_SUCCESS : GetLastError();
-    // ERROR_NO_DATA: a client opened it and closed it again before this call - the exit release, or a client that
-    // died at once. Either way something came; ClientGone says which.
-    if (!connected && err != ERROR_PIPE_CONNECTED && err != ERROR_NO_DATA)
+    status = connected ? ERROR_SUCCESS : GetLastError();
+    // ERROR_NO_DATA: something opened it and closed it again before this call - the exit release, or a client that
+    // wrote and exited at once. Either way something came; ClientGone says which.
+    if (!connected && status != ERROR_PIPE_CONNECTED && status != ERROR_NO_DATA)
     {
-        status = win_perror2(err, "ConnectNamedPipe(inbound)");
+        step = L"ConnectNamedPipe(inbound)";
         goto fail;
     }
     UnregisterWaitEx(wait, INVALID_HANDLE_VALUE);   // a running release finishes first; none starts after this
     wait = NULL;
     if (InterlockedCompareExchange(&hs->ClientGone, 0, 0))
     {
-        LogWarning("[%lld] client pid %lu exited before it opened its inbound pipe; dropped, the server goes on",
-                   hs->ClientId, pid);
         status = ERROR_BROKEN_PIPE;
+        step = L"exited before it opened its inbound pipe";
         goto fail;
     }
     CloseHandle(process);
@@ -937,6 +949,9 @@ static DWORD WINAPI QpsHandshakeThread(PVOID param)
     return status;
 
 fail:
+    // The pipe errors a client's leaving produces on the steps above.
+    left = status == ERROR_BROKEN_PIPE || status == ERROR_NO_DATA || status == ERROR_PIPE_NOT_CONNECTED;
+fail_logged:
     if (wait)
         UnregisterWaitEx(wait, INVALID_HANDLE_VALUE);
     if (process)
@@ -944,9 +959,13 @@ fail:
     if (readPipe != INVALID_HANDLE_VALUE)
         CloseHandle(readPipe);
     CloseHandle(hs->WritePipe);
-    if (status != ERROR_BROKEN_PIPE)
-        LogError("[%lld] handshake with client pid %lu failed (0x%x); dropped, the server goes on",
-                 hs->ClientId, pid, status);
+    // One line per dropped client: its leaving is the client's own business (a warning); anything else is ours.
+    if (left)
+        LogWarning("[%lld] client pid %lu left during the handshake (%s: %lu); dropped, the server goes on",
+                   hs->ClientId, pid, step, status);
+    else
+        LogError("[%lld] handshake with client pid %lu failed (%s: %lu); dropped, the server goes on",
+                 hs->ClientId, pid, step, status);
     free(hs);
     return status;
 }
