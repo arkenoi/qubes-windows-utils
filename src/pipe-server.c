@@ -575,12 +575,21 @@ static DWORD QpsConnectClient(
     PPIPE_CLIENT client;
     DWORD status;
 
+    // Both early returns own the pipes too (see the fail path): the handshake that called this goes on without them.
     if (!Server->AcceptConnections)
+    {
+        CloseHandle(WritePipe);
+        CloseHandle(ReadPipe);
         return ERROR_SHUTDOWN_IN_PROGRESS;
+    }
 
     client = malloc(sizeof(PIPE_CLIENT));
     if (!client)
+    {
+        CloseHandle(WritePipe);
+        CloseHandle(ReadPipe);
         return ERROR_NOT_ENOUGH_MEMORY;
+    }
 
     ZeroMemory(client, sizeof(PIPE_CLIENT));
     client->Id = ClientId;
@@ -685,9 +694,8 @@ fail:
         CmqDestroy(client->ReadBuffer);
     DeleteCriticalSection(&client->Lock);
     free(client);
-    // THE PIPES, WHICH NOBODY ELSE WILL CLOSE: the accept loop creates them and hands them in, and
-    // on failure its caller does `if (status != ERROR_SUCCESS) return status;` without touching
-    // them. On success they belong to the client and QpsDisconnectClientInternal closes them, so
+    // THE PIPES, WHICH NOBODY ELSE WILL CLOSE: the client's handshake (QpsHandshakeThread) creates
+    // them and hands them in, and on failure only logs. On success they belong to the client and QpsDisconnectClientInternal closes them, so
     // this function owns them in both outcomes or a handle pair leaks per failure.
     if (WritePipe)
         CloseHandle(WritePipe);
@@ -818,15 +826,139 @@ static void QpsDisconnectClientInternal(
         disconnectCallback(Server, ClientId, Server->UserContext);
 }
 
+// ONE CLIENT'S HANDSHAKE, OFF THE ACCEPT THREAD (GWeck post 241 item D, 2026-11-25). The accept loop used to run it
+// inline: create the client's unique inbound pipe, send its name, then wait in a blocking ConnectNamedPipe for the
+// client to open it - upstream's own FIXME, "this blocks forever if the client never connects here". A client that
+// connected to the public pipe and then never opened its inbound one (killed, crashed, stopped) parked the accept loop
+// for ever: the daemon stayed alive and every later client waited in WaitNamedPipe(NMPWAIT_WAIT_FOREVER) - qubesdb
+// unanswered for the whole boot, which is the shape of an update stuck at "last phase: init" behind
+// Get-QubesVmClass. And any failed step of that inline handshake RETURNED from QpsMainLoop, ending the server
+// (qubesdb-daemon exits when its pipe thread does) because of one client.
+// Now each handshake runs here. The client's process exit releases it, with no clock: a one-shot thread-pool wait
+// on the process marks the client gone and opens the inbound pipe itself, which completes the ConnectNamedPipe below
+// whether it is already waiting or not yet called (then it reports ERROR_PIPE_CONNECTED or ERROR_NO_DATA).
+typedef struct _QPS_HANDSHAKE
+{
+    PIPE_SERVER Server;
+    HANDLE WritePipe;
+    LONGLONG ClientId;
+    volatile LONG ClientGone;
+    WCHAR PipeName[256];
+} QPS_HANDSHAKE;
+
+static VOID CALLBACK QpsHandshakeClientExited(PVOID context, BOOLEAN timedOut)
+{
+    QPS_HANDSHAKE* hs = (QPS_HANDSHAKE*)context;
+    HANDLE pipe;
+    UNREFERENCED_PARAMETER(timedOut);
+    InterlockedExchange(&hs->ClientGone, 1);
+    pipe = CreateFile(hs->PipeName, GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
+    if (pipe != INVALID_HANDLE_VALUE)
+        CloseHandle(pipe);
+}
+
+static DWORD WINAPI QpsHandshakeThread(PVOID param)
+{
+    QPS_HANDSHAKE* hs = (QPS_HANDSHAKE*)param;
+    HANDLE readPipe = INVALID_HANDLE_VALUE, process = NULL, wait = NULL;
+    DWORD status = ERROR_SUCCESS, cbPipeName, written, err;
+    ULONG pid = 0;
+    BOOL connected;
+
+    if (!GetNamedPipeClientProcessId(hs->WritePipe, &pid))
+    {
+        status = win_perror("GetNamedPipeClientProcessId");
+        goto fail;
+    }
+    hs->ClientId = QpsAllocateClientId(hs->Server);
+    StringCbPrintf(hs->PipeName, sizeof(hs->PipeName), L"%s-%lu-%lld", hs->Server->PipeName, pid, hs->ClientId);
+    readPipe = CreateNamedPipe(hs->PipeName,
+                               PIPE_ACCESS_INBOUND,
+                               PIPE_TYPE_BYTE | PIPE_WAIT,
+                               PIPE_UNLIMITED_INSTANCES,
+                               hs->Server->PipeBufferSize,
+                               hs->Server->PipeBufferSize,
+                               0,
+                               hs->Server->SecurityAttributes);
+    if (readPipe == INVALID_HANDLE_VALUE)
+    {
+        status = win_perror("CreateNamedPipe(inbound)");
+        goto fail;
+    }
+    // Before the name is sent: from here the client's exit always releases the wait below.
+    process = OpenProcess(SYNCHRONIZE, FALSE, pid);
+    if (!process)
+    {
+        status = win_perror("OpenProcess(pipe client)");   // the client is already gone
+        goto fail;
+    }
+    if (!RegisterWaitForSingleObject(&wait, process, QpsHandshakeClientExited, hs, INFINITE, WT_EXECUTEONLYONCE))
+    {
+        wait = NULL;
+        status = win_perror("RegisterWaitForSingleObject(pipe client)");
+        goto fail;
+    }
+
+    cbPipeName = (DWORD)(wcslen(hs->PipeName) + 1) * sizeof(WCHAR);
+    if (!WriteFile(hs->WritePipe, &cbPipeName, sizeof(cbPipeName), &written, NULL) ||
+        !WriteFile(hs->WritePipe, hs->PipeName, cbPipeName, &written, NULL))
+    {
+        status = win_perror("writing the inbound pipe name");
+        goto fail;
+    }
+
+    LogVerbose("[%lld] waiting for inbound connection, pipe %s", hs->ClientId, hs->PipeName);
+    connected = ConnectNamedPipe(readPipe, NULL);
+    err = connected ? ERROR_SUCCESS : GetLastError();
+    // ERROR_NO_DATA: a client opened it and closed it again before this call - the exit release, or a client that
+    // died at once. Either way something came; ClientGone says which.
+    if (!connected && err != ERROR_PIPE_CONNECTED && err != ERROR_NO_DATA)
+    {
+        status = win_perror2(err, "ConnectNamedPipe(inbound)");
+        goto fail;
+    }
+    UnregisterWaitEx(wait, INVALID_HANDLE_VALUE);   // a running release finishes first; none starts after this
+    wait = NULL;
+    if (InterlockedCompareExchange(&hs->ClientGone, 0, 0))
+    {
+        LogWarning("[%lld] client pid %lu exited before it opened its inbound pipe; dropped, the server goes on",
+                   hs->ClientId, pid);
+        status = ERROR_BROKEN_PIPE;
+        goto fail;
+    }
+    CloseHandle(process);
+    LogVerbose("[%lld] inbound pipe connected", hs->ClientId);
+    // Owns both pipes from here, in success and in failure (its own fail path closes them).
+    status = QpsConnectClient(hs->Server, hs->ClientId, hs->WritePipe, readPipe);
+    if (status != ERROR_SUCCESS && status != ERROR_SHUTDOWN_IN_PROGRESS)
+        LogError("[%lld] client pid %lu could not be connected (0x%x); dropped, the server goes on",
+                 hs->ClientId, pid, status);
+    free(hs);
+    return status;
+
+fail:
+    if (wait)
+        UnregisterWaitEx(wait, INVALID_HANDLE_VALUE);
+    if (process)
+        CloseHandle(process);
+    if (readPipe != INVALID_HANDLE_VALUE)
+        CloseHandle(readPipe);
+    CloseHandle(hs->WritePipe);
+    if (status != ERROR_BROKEN_PIPE)
+        LogError("[%lld] handshake with client pid %lu failed (0x%x); dropped, the server goes on",
+                 hs->ClientId, pid, status);
+    free(hs);
+    return status;
+}
+
 // Returns only on error. At that point the server state is undefined, call QpsDestroy().
 DWORD QpsMainLoop(
     PIPE_SERVER Server
     )
 {
     BOOL connected;
-    HANDLE writePipe, readPipe;
+    HANDLE writePipe;
     DWORD status;
-    WCHAR pipeName[256];
 
     // THE ONE PUBLIC ENTRY THAT DOES NOT GO THROUGH THE CLIENT LOOKUP, so it carries the guard
     // itself. Everything else that takes a server and a client id reaches the list through
@@ -839,10 +971,8 @@ DWORD QpsMainLoop(
         LogWarning("called with a %s server; nothing to accept on", Server ? "destroyed" : "NULL");
         return ERROR_INVALID_HANDLE;
     }
-    ULONG pid;
-    LONGLONG clientId;
-    DWORD cbPipeName;
-    DWORD written;
+    QPS_HANDSHAKE* hs;
+    HANDLE thread;
 
     while (TRUE)
     {
@@ -854,62 +984,44 @@ DWORD QpsMainLoop(
                                     Server->PipeBufferSize,
                                     0,
                                     Server->SecurityAttributes);
+        // The one pipe this loop cannot go on without (ADR-qrexec section 3, decision 2).
+        if (writePipe == INVALID_HANDLE_VALUE)
+            return win_perror("CreateNamedPipe(outbound)");
 
         // wait for connection
         do
         {
             LogVerbose("waiting for outbound connection, pipe %s", Server->PipeName);
-            connected = ConnectNamedPipe(writePipe, NULL) ? TRUE : (GetLastError() == ERROR_PIPE_CONNECTED);
+            connected = ConnectNamedPipe(writePipe, NULL);
+            // ERROR_NO_DATA: a client opened this instance and closed it again before the call. It counts as connected
+            // (ADR-qrexec section 3, decision 3) - its handshake then fails alone, one error line - where retrying the
+            // call unchanged answered ERROR_NO_DATA for good and this loop spun, accepting no one.
+            if (!connected && (GetLastError() == ERROR_PIPE_CONNECTED || GetLastError() == ERROR_NO_DATA))
+                connected = TRUE;
             if (!connected)
                 Sleep(10);
         } while (!connected);
 
         LogVerbose("outbound pipe connected");
-        // prepare the read pipe
-        if (!GetNamedPipeClientProcessId(writePipe, &pid))
+        // The rest of this client's handshake is its own thread's (QpsHandshakeThread): one client never holds the
+        // accept loop. Resource failures here end the loop as before.
+        hs = calloc(1, sizeof(*hs));
+        if (!hs)
         {
-            return win_perror("GetNamedPipeClientProcessId");
+            CloseHandle(writePipe);
+            return ERROR_NOT_ENOUGH_MEMORY;
         }
-
-        clientId = QpsAllocateClientId(Server);
-        // create the second pipe with unique name
-        StringCbPrintf(pipeName, sizeof(pipeName), L"%s-%lu-%lld", Server->PipeName, pid, clientId);
-        readPipe = CreateNamedPipe(pipeName,
-                                   PIPE_ACCESS_INBOUND,
-                                   PIPE_TYPE_BYTE | PIPE_WAIT,
-                                   PIPE_UNLIMITED_INSTANCES,
-                                   Server->PipeBufferSize,
-                                   Server->PipeBufferSize,
-                                   0,
-                                   Server->SecurityAttributes);
-
-        // send the name to the client
-        cbPipeName = (DWORD) (wcslen(pipeName) + 1) * sizeof(WCHAR);
-        if (!WriteFile(writePipe, &cbPipeName, sizeof(cbPipeName), &written, NULL))
+        hs->Server = Server;
+        hs->WritePipe = writePipe;
+        thread = CreateThread(NULL, 0, QpsHandshakeThread, hs, 0, NULL);
+        if (!thread)
         {
-            return win_perror("writing size of inbound pipe name");
-        }
-
-        if (!WriteFile(writePipe, pipeName, cbPipeName, &written, NULL))
-        {
-            return win_perror("writing name of inbound pipe");
-        }
-
-        // FIXME: this blocks forever if the client never connects here
-        // readPipe needs to be open in async mode
-        do
-        {
-            LogVerbose("waiting for inbound connection, pipe %s", pipeName);
-            connected = ConnectNamedPipe(readPipe, NULL) ? TRUE : (GetLastError() == ERROR_PIPE_CONNECTED);
-            if (!connected)
-                Sleep(10);
-        } while (!connected);
-        LogVerbose("inbound pipe connected");
-
-        // initialize the client
-        status = QpsConnectClient(Server, clientId, writePipe, readPipe);
-        if (status != ERROR_SUCCESS)
+            status = win_perror("CreateThread(pipe handshake)");
+            CloseHandle(writePipe);
+            free(hs);
             return status;
+        }
+        CloseHandle(thread);
     }
 }
 
