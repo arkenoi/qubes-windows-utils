@@ -840,44 +840,14 @@ static void QpsDisconnectClientInternal(
 // when THAT open succeeded: a client that opened its inbound pipe itself holds the one instance, the release's open
 // then fails (ERROR_PIPE_BUSY), and the client is served - what it wrote before it exited is still read, as before.
 // A client that left during the handshake is one warning line; any other failed step is one error line.
-// A HANDSHAKE THAT STAYS OPEN IS NAMED, ONCE (owner 2026-11-26: «"qubesdb stopped answering" is a severe error which we do
-// not want to ignore. but not misdiagnose, either»). Since the handshake left the accept loop, a client that never opens its
-// inbound pipe holds only its own thread, but it was invisible until its process exited - and on a build before that change
-// it is the client that silences the whole server for every other caller. A one-shot timer logs its pid and image once,
-// QPS_HANDSHAKE_SLOW_MS into the handshake (a handshake takes milliseconds). It is a report, not a bound: nothing is
-// aborted, retried or changed, and the client is still released only by opening its pipe or by exiting.
-#define QPS_HANDSHAKE_SLOW_MS 10000
-
 typedef struct _QPS_HANDSHAKE
 {
     PIPE_SERVER Server;
     HANDLE WritePipe;
     LONGLONG ClientId;
-    ULONG Pid;
     volatile LONG ClientGone;
-    volatile LONG SlowReported;
     WCHAR PipeName[256];
 } QPS_HANDSHAKE;
-
-static VOID CALLBACK QpsHandshakeSlow(PVOID context, BOOLEAN timerFired)
-{
-    QPS_HANDSHAKE* hs = (QPS_HANDSHAKE*)context;
-    WCHAR image[MAX_PATH];
-    DWORD cch = ARRAYSIZE(image);
-    HANDLE process;
-    UNREFERENCED_PARAMETER(timerFired);
-    StringCchCopy(image, ARRAYSIZE(image), L"image unreadable");
-    process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, hs->Pid);
-    if (process)
-    {
-        if (!QueryFullProcessImageName(process, 0, image, &cch))
-            StringCchCopy(image, ARRAYSIZE(image), L"image unreadable");
-        CloseHandle(process);
-    }
-    InterlockedExchange(&hs->SlowReported, 1);
-    LogWarning("[%lld] client pid %lu (%s) has not opened its inbound pipe %lu s into the handshake; other clients are served, "
-               "this one waits until it opens the pipe or exits", hs->ClientId, hs->Pid, image, (ULONG)(QPS_HANDSHAKE_SLOW_MS / 1000));
-}
 
 static VOID CALLBACK QpsHandshakeClientExited(PVOID context, BOOLEAN timedOut)
 {
@@ -895,7 +865,7 @@ static VOID CALLBACK QpsHandshakeClientExited(PVOID context, BOOLEAN timedOut)
 static DWORD WINAPI QpsHandshakeThread(PVOID param)
 {
     QPS_HANDSHAKE* hs = (QPS_HANDSHAKE*)param;
-    HANDLE readPipe = INVALID_HANDLE_VALUE, process = NULL, wait = NULL, slow = NULL;
+    HANDLE readPipe = INVALID_HANDLE_VALUE, process = NULL, wait = NULL;
     DWORD status = ERROR_SUCCESS, cbPipeName, written;
     const WCHAR* step = L"";
     ULONG pid = 0;
@@ -907,7 +877,6 @@ static DWORD WINAPI QpsHandshakeThread(PVOID param)
         step = L"GetNamedPipeClientProcessId";
         goto fail;
     }
-    hs->Pid = pid;
     hs->ClientId = QpsAllocateClientId(hs->Server);
     StringCbPrintf(hs->PipeName, sizeof(hs->PipeName), L"%s-%lu-%lld", hs->Server->PipeName, pid, hs->ClientId);
     readPipe = CreateNamedPipe(hs->PipeName,
@@ -941,13 +910,6 @@ static DWORD WINAPI QpsHandshakeThread(PVOID param)
         step = L"RegisterWaitForSingleObject(pipe client)";
         goto fail;
     }
-    // The report must not be able to fail the handshake it reports on: without its timer the handshake goes on, unreported.
-    if (!CreateTimerQueueTimer(&slow, NULL, QpsHandshakeSlow, hs, QPS_HANDSHAKE_SLOW_MS, 0, WT_EXECUTEONLYONCE))
-    {
-        slow = NULL;
-        LogWarning("[%lld] no slow-handshake report for client pid %lu (CreateTimerQueueTimer: %lu); the handshake goes on",
-                   hs->ClientId, pid, GetLastError());
-    }
 
     cbPipeName = (DWORD)(wcslen(hs->PipeName) + 1) * sizeof(WCHAR);
     if (!WriteFile(hs->WritePipe, &cbPipeName, sizeof(cbPipeName), &written, NULL) ||
@@ -970,11 +932,6 @@ static DWORD WINAPI QpsHandshakeThread(PVOID param)
     }
     UnregisterWaitEx(wait, INVALID_HANDLE_VALUE);   // a running release finishes first; none starts after this
     wait = NULL;
-    if (slow)
-    {
-        DeleteTimerQueueTimer(NULL, slow, INVALID_HANDLE_VALUE);   // a running report finishes first; none starts after this
-        slow = NULL;
-    }
     if (InterlockedCompareExchange(&hs->ClientGone, 0, 0))
     {
         status = ERROR_BROKEN_PIPE;
@@ -982,8 +939,6 @@ static DWORD WINAPI QpsHandshakeThread(PVOID param)
         goto fail;
     }
     CloseHandle(process);
-    if (InterlockedCompareExchange(&hs->SlowReported, 0, 0))
-        LogInfo("[%lld] client pid %lu opened its inbound pipe after the slow-handshake report", hs->ClientId, pid);
     LogVerbose("[%lld] inbound pipe connected", hs->ClientId);
     // Owns both pipes from here, in success and in failure (its own fail path closes them).
     status = QpsConnectClient(hs->Server, hs->ClientId, hs->WritePipe, readPipe);
@@ -999,8 +954,6 @@ fail:
 fail_logged:
     if (wait)
         UnregisterWaitEx(wait, INVALID_HANDLE_VALUE);
-    if (slow)
-        DeleteTimerQueueTimer(NULL, slow, INVALID_HANDLE_VALUE);   // before hs is freed: the report reads it
     if (process)
         CloseHandle(process);
     if (readPipe != INVALID_HANDLE_VALUE)
