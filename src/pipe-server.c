@@ -625,6 +625,28 @@ static DWORD QpsConnectClient(
         goto fail;
     }
 
+    // SINGLE LOAD, THEN USE THE LOCAL COPY - the field must not be re-read between the guard and the
+    // call, which run OUTSIDE Server->Lock. MEASURED in the shipped windows-utils.dll of package
+    // 4.3.39+agent.1f7216b11d1e, at 0x180005c30, when an InterlockedIncrement sat between the test
+    // and the call:
+    //     cmp  QWORD PTR [rsi+0x270],rbx   ; rbx is 0 (xor ebx,ebx at 0x180005b45) - the NULL test
+    //     je   skip
+    //     lock inc DWORD PTR [rdi+0x78]    ; the InterlockedIncrement
+    //     mov  rax,QWORD PTR [rsi+0x270]   ; RELOAD of the same field
+    //     call rax                         ; called without re-testing
+    // A field cleared between the test and the reload turns that into `call 0` - exactly c0000005
+    // "execute of 0000000000000000", p0=8 p1=0. Today only QpsCreate writes the field; the single
+    // load keeps the test and the call on one value whatever is added later.
+    const QPS_CLIENT_CONNECTED connectCallback = Server->ConnectCallback;
+
+    // THE HOST'S REFERENCE EXISTS BEFORE THE CLIENT CAN BE FOUND (AUDIT-qrexec #9). Taken after the
+    // resume, as it was, a reader whose first read failed could give back the last reference and
+    // free the client while this thread still used it. Now a worker thread that runs to its end as
+    // soon as it is resumed gives back only its own reference, so the client stays valid for the
+    // rest of this function and until the host calls QpsDisconnectClient.
+    if (connectCallback)
+        client->RefCount = 1;
+
     // PUBLISH. After this the client is findable, so the threads may run - and from here on the
     // client belongs to the server: it is torn down by QpsDisconnectClient/QpsReleaseClient, never
     // by this function.
@@ -644,30 +666,21 @@ static DWORD QpsConnectClient(
         win_perror("ResumeThread");
         LogError("[%lld] worker threads could not be resumed; disconnecting", ClientId);
         QpsDisconnectClientInternal(Server, ClientId, FALSE, FALSE);
+        // The host is never told about this client, so its reference is given back here. It kept
+        // the client valid through the disconnect above, whose own lookup gives back its own.
+        if (connectCallback)
+            QpsReleaseClient(Server, client);
         return ERROR_NO_SYSTEM_RESOURCES;
     }
 
-    // SINGLE LOAD, THEN CALL THE LOCAL COPY - the field must not be re-read between the guard
-    // and the call. Both the test and the call run OUTSIDE Server->Lock, which
-    // LeaveCriticalSection released above, and the InterlockedIncrement between them forces the
-    // compiler to reload the field. MEASURED in the shipped windows-utils.dll of package
-    // 4.3.39+agent.1f7216b11d1e, at 0x180005c30:
-    //     cmp  QWORD PTR [rsi+0x270],rbx   ; rbx is 0 (xor ebx,ebx at 0x180005b45) - the NULL test
-    //     je   skip
-    //     lock inc DWORD PTR [rdi+0x78]    ; the InterlockedIncrement below
-    //     mov  rax,QWORD PTR [rsi+0x270]   ; RELOAD of the same field
-    //     call rax                         ; called without re-testing
-    // A thread clearing ConnectCallback (QpsDestroy) between the test and the reload turns this
-    // into `call 0` - exactly c0000005 "execute of 0000000000000000", p0=8 p1=0.
-    const QPS_CLIENT_CONNECTED connectCallback = Server->ConnectCallback;
     if (connectCallback)
     {
-        // Increase the refcount if the connect callback is registered (pretty much always).
-        // Our host (application that registered the callback) will need to call
-        // QpsDisconnectClient after it's done interacting with the client
-        // (this will decrease the refcount and allow for client data cleanup).
-        InterlockedIncrement(&client->RefCount);
-        connectCallback(Server, client->Id, Server->UserContext);
+        // The reference taken before the publish is the host's from here on. The host (the
+        // application that registered the callback) calls QpsDisconnectClient when it is done with
+        // the client; that gives the reference back and lets the client's data be freed. The host
+        // may do so from inside the callback, so the client is not touched after it - nor for the
+        // call: the id is this function's own argument.
+        connectCallback(Server, ClientId, Server->UserContext);
     }
 
     return ERROR_SUCCESS;
