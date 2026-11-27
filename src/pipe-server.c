@@ -402,7 +402,7 @@ static DWORD WINAPI QpsReaderThread(
     while (TRUE)
     {
         LogVerbose("[%lld] reading...", client->Id);
-        // reading will fail even if blocked when we call CancelIo() from QpsDisconnectClient
+        // A blocked read fails when QpsDisconnectClientInternal cancels the I/O on this handle.
         if (!ReadFile(pipe, buffer, server->PipeBufferSize, &transferred, NULL)) // this can block
         {
             // WHY THE READ ENDED, instead of one warning for every reason. This pipe protocol has
@@ -524,7 +524,7 @@ static DWORD WINAPI QpsWriterThread(
             LeaveCriticalSection(&client->Lock);
 
             LogVerbose("[%lld] writing %lu 0x%lx", client->Id, size, size);
-            // writing will fail even if blocked when we call CancelIo() from QpsDisconnectClient
+            // A blocked write fails when QpsDisconnectClientInternal cancels the I/O on this handle.
             if (!QioWriteBuffer(pipe, data, (DWORD)size)) // this can block
             {
                 // win_perror("QioWriteBuffer");
@@ -786,7 +786,10 @@ static void QpsDisconnectClientInternal(
         if (WaitForSingleObject(client->WriterThread, Server->WriteTimeout) != WAIT_OBJECT_0)
         {
             LogWarning("[%lld] writer thread didn't terminate in time, canceling write", ClientId);
-            if (!CancelIo(client->WritePipe)) // this will abort a blocking operation
+            // The write belongs to the writer thread, so it is cancelled by handle and not by calling
+            // thread: CancelIo cancels only the caller's own I/O, which here is none (AUDIT-qrexec #11).
+            // Nothing to cancel is not an error: the writer is between two writes.
+            if (!CancelIoEx(client->WritePipe, NULL) && GetLastError() != ERROR_NOT_FOUND) // this will abort a blocking operation
                 win_perror("CancelIo(write)");
         }
 
@@ -808,7 +811,11 @@ static void QpsDisconnectClientInternal(
     {
         // wait for the reader thread to exit
         LogVerbose("[%lld] (%p) canceling read", ClientId, client);
-        if (!CancelIo(client->ReadPipe)) // this will abort a blocking operation
+        // The read belongs to the reader thread, so it is cancelled by handle and not by calling
+        // thread (AUDIT-qrexec #11). Nothing to cancel is not an error: the reader is between two
+        // reads. A reader that starts a read after this cancel is still ended by the wait and the
+        // kill below, which stay.
+        if (!CancelIoEx(client->ReadPipe, NULL) && GetLastError() != ERROR_NOT_FOUND) // this will abort a blocking operation
             win_perror("CancelIo(read)");
 
         if (WaitForSingleObject(client->ReaderThread, 100) != WAIT_OBJECT_0)
