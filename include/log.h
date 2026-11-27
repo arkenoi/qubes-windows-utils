@@ -77,10 +77,24 @@ enum
 WINDOWSUTILS_API
 DWORD LogInitDefault(IN const WCHAR *logName OPTIONAL);
 
-// Formats unique log file path and calls LogStart.
-// If logDir is NULL, use default log location.
+// The private volume's log directory: the rule's second step (docs/ADR-logging.md 1).
+#define LOG_PRIVATE_DIR L"Q:\\Qubes Logs"
+// The longest note LogGetDirectory writes, in characters.
+#define LOG_DIR_NOTE_MAX 1024
+
+// Formats the log file path and calls LogStart. logDir is the configured directory (NULL = the
+// registry LogDir for logName); the directory used is chosen by the one rule, as LogGetDirectory
+// describes, and a fallback is the first line of the file.
 WINDOWSUTILS_API
 void LogInit(IN const WCHAR *logDir OPTIONAL, IN const WCHAR *logName);
+
+// THE ONE LOG DIRECTORY (docs/ADR-logging.md 1), for a writer that does not log through LogInit: the
+// registry LogDir read for logName (the module key first, then the root; NULL reads the root), else
+// LOG_PRIVATE_DIR, else <SystemDrive>\Qubes Logs - the first that exists or can be made. On ERROR_SUCCESS
+// dir holds it. note (optional, LOG_DIR_NOTE_MAX is enough) gets every step that failed and where the log
+// goes, which the writer puts first in that directory, or "" when the registry value held.
+WINDOWSUTILS_API
+DWORD LogGetDirectory(IN const WCHAR *logName OPTIONAL, OUT WCHAR *dir, IN DWORD cchDir, OUT WCHAR *note OPTIONAL, IN DWORD cchNote);
 
 // If logfilePath is NULL, use stderr.
 WINDOWSUTILS_API

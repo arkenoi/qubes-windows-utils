@@ -248,6 +248,113 @@ int LogGetLevel(void)
     return g_LogLevel;
 }
 
+// A STEP IS USABLE when its directory exists or can be made AND is a directory: CreateDirectory's
+// ERROR_ALREADY_EXISTS also answers for a FILE of that name. Only the last component is made, as before.
+static DWORD LogDirUsable(IN const WCHAR *dir)
+{
+    DWORD attrs, status;
+
+    if (!CreateDirectory(dir, NULL))
+    {
+        status = GetLastError();
+        if (status != ERROR_ALREADY_EXISTS)
+            return status;
+    }
+    attrs = GetFileAttributes(dir);
+    if (attrs == INVALID_FILE_ATTRIBUTES)
+        return GetLastError();
+    return (attrs & FILE_ATTRIBUTE_DIRECTORY) ? ERROR_SUCCESS : ERROR_DIRECTORY;
+}
+
+// THE ONE LOG DIRECTORY RULE (docs/ADR-logging.md 1), and the only place it is written: the configured
+// LogDir (NULL or "" = not set), else LOG_PRIVATE_DIR on the private volume, else <SystemDrive>\Qubes Logs.
+// A step whose directory cannot be used falls through to the next. On ERROR_SUCCESS dir holds the first
+// usable one. note gets every step that failed and where the log goes - the line the writer puts first in
+// that directory - or "" when the configured step held.
+static DWORD LogResolveDir(IN const WCHAR *configured OPTIONAL, OUT WCHAR *dir, IN DWORD cchDir,
+                           OUT WCHAR *note, IN DWORD cchNote)
+{
+    WCHAR systemDir[MAX_PATH];
+    const WCHAR *chosen = NULL;
+    size_t len = 0;
+    DWORD status;
+
+    note[0] = L'\0';
+    if (configured && configured[0])
+    {
+        status = LogDirUsable(configured);
+        if (status == ERROR_SUCCESS)
+            return SUCCEEDED(StringCchCopy(dir, cchDir, configured)) ? ERROR_SUCCESS : ERROR_INSUFFICIENT_BUFFER;
+        StringCchPrintf(note, cchNote, L"LogDir '%s' cannot be used (error %lu)", configured, status);
+    }
+    else
+        StringCchCopy(note, cchNote, L"LogDir is not set");
+
+    // the private step, unless the configured value already WAS it
+    if (!(configured && lstrcmpiW(configured, LOG_PRIVATE_DIR) == 0))
+    {
+        status = LogDirUsable(LOG_PRIVATE_DIR);
+        if (status == ERROR_SUCCESS)
+            chosen = LOG_PRIVATE_DIR;
+        else
+        {
+            StringCchLength(note, cchNote, &len);
+            StringCchPrintf(note + len, cchNote - len, L"; the private volume's %s cannot be used (error %lu)",
+                            LOG_PRIVATE_DIR, status);
+        }
+    }
+
+    if (!chosen)
+    {
+        if (!GetSystemDirectory(systemDir, RTL_NUMBER_OF(systemDir)) ||
+            FAILED(StringCchCopy(systemDir + 3, RTL_NUMBER_OF(systemDir) - 3, LOG_DEFAULT_DIR)))
+        {
+            status = GetLastError() ? GetLastError() : ERROR_PATH_NOT_FOUND;
+            StringCchLength(note, cchNote, &len);
+            StringCchPrintf(note + len, cchNote - len, L"; the system drive cannot be named (error %lu) - no log directory", status);
+            return status;
+        }
+        status = LogDirUsable(systemDir);
+        if (status != ERROR_SUCCESS)
+        {
+            StringCchLength(note, cchNote, &len);
+            StringCchPrintf(note + len, cchNote - len, L"; the system drive's %s cannot be used (error %lu) - no log directory",
+                            systemDir, status);
+            return status;
+        }
+        chosen = systemDir;
+    }
+
+    if (FAILED(StringCchCopy(dir, cchDir, chosen)))
+        return ERROR_INSUFFICIENT_BUFFER;
+    StringCchLength(note, cchNote, &len);
+    StringCchPrintf(note + len, cchNote - len, L" - logging to '%s'", chosen);
+    return ERROR_SUCCESS;
+}
+
+// The rule for a writer that does not log through LogInit (log.h).
+DWORD LogGetDirectory(IN const WCHAR *logName OPTIONAL, OUT WCHAR *dir, IN DWORD cchDir, OUT WCHAR *note OPTIONAL, IN DWORD cchNote)
+{
+    WCHAR localNote[LOG_DIR_NOTE_MAX];
+    WCHAR *configured;
+    DWORD status;
+
+    if (!dir || cchDir == 0)
+        return ERROR_INVALID_PARAMETER;
+    if (!note || cchNote == 0)
+    {
+        note = localNote;
+        cchNote = RTL_NUMBER_OF(localNote);
+    }
+    configured = malloc(MAX_PATH_LONG_WSIZE);
+    if (!configured)
+        return ERROR_OUTOFMEMORY;
+    status = CfgReadString(logName, LOG_CONFIG_PATH_VALUE, configured, MAX_PATH_LONG, NULL);
+    status = LogResolveDir(status == ERROR_SUCCESS ? configured : NULL, dir, cchDir, note, cchNote);
+    free(configured);
+    return status;
+}
+
 void LogInit(IN const WCHAR *logDir OPTIONAL, IN const WCHAR *logName)
 {
     SYSTEMTIME st;
@@ -260,6 +367,8 @@ void LogInit(IN const WCHAR *logDir OPTIONAL, IN const WCHAR *logName)
     HANDLE token;
     DWORD sessionId;
     WCHAR* logPath = NULL;
+    WCHAR* dirBuf = NULL;
+    WCHAR dirNote[LOG_DIR_NOTE_MAX] = { 0 };
 
     if (g_LogLevel < 0)
         g_LogLevel = LOG_LEVEL_DEFAULT;
@@ -267,37 +376,24 @@ void LogInit(IN const WCHAR *logDir OPTIONAL, IN const WCHAR *logName)
     StringCchCopy(g_LogName, RTL_NUMBER_OF(g_LogName), logName);
     GetLocalTime(&st);
 
-    // if logDir is NULL, use default log location
-    if (!logDir)
+    // THE DIRECTORY BY THE ONE RULE (docs/ADR-logging.md 1): logDir as configured, else the private
+    // volume, else the system drive - the first that exists or can be made.
+    dirBuf = malloc(MAX_PATH_LONG_WSIZE);
+    if (!dirBuf)
     {
-        // Prepare default log path (%SYSTEMDRIVE%\QubesLogs)
-
-        if (!GetSystemDirectory(systemPath, RTL_NUMBER_OF(systemPath)))
-        {
-            LogStart(NULL);
-            LogWarning("GetSystemDirectory"); // this will just write to stderr before logfile is initialized
-            goto fallback;
-        }
-
-        if (FAILED(StringCchCopy(systemPath + 3, RTL_NUMBER_OF(systemPath) - 3, LOG_DEFAULT_DIR L"\0")))
-        {
-            LogStart(NULL);
-            LogWarning("StringCchCopy failed");
-            goto fallback;
-        }
-        logDir = systemPath;
+        LogStart(NULL);
+        LogWarning("Out of memory");
+        goto fallback;
     }
-
-    if (!CreateDirectory(logDir, NULL))
+    // NULL: the configured value is the registry's, read for this module (LogGetDirectory)
+    if (ERROR_SUCCESS != (logDir ? LogResolveDir(logDir, dirBuf, MAX_PATH_LONG, dirNote, RTL_NUMBER_OF(dirNote))
+                                 : LogGetDirectory(g_LogName, dirBuf, MAX_PATH_LONG, dirNote, RTL_NUMBER_OF(dirNote))))
     {
-        if (GetLastError() != ERROR_ALREADY_EXISTS)
-        {
-            LogStart(NULL);
-            win_perror("CreateDirectory");
-            LogWarning("failed to create %s", logDir);
-            goto fallback;
-        }
+        LogStart(NULL);
+        LogWarning("%s", dirNote); // stderr: no step gave a directory
+        goto fallback;
     }
+    logDir = dirBuf;
 
     PurgeOldLogs(logDir);
 
@@ -320,6 +416,10 @@ void LogInit(IN const WCHAR *logDir OPTIONAL, IN const WCHAR *logName)
 
     LogStart(logPath);
 
+    // THE FIRST LINE NAMES THE STEP THAT FAILED, in the directory this process landed in (ADR-logging 1).
+    if (dirNote[0])
+        LogWarning("QWTLOGDIRFALLBACK %s", dirNote);
+
     // NOW the logger is up, so the degradation can be said where it will be counted.
     if (g_LogDegraded)
     {
@@ -331,6 +431,7 @@ void LogInit(IN const WCHAR *logDir OPTIONAL, IN const WCHAR *logName)
 
 fallback:
     free(logPath);
+    free(dirBuf);
     // THE STARTUP BANNER IS DEBUG, NOT AN EVENT. qrexec-wrapper is spawned once per qrexec
     // call: measured on acceptance run 39225775322, one brief cell logged 155 invocations, and
     // these six lines times 155 is ~1085 of that module's 1250 lines - 87% of it a process
@@ -428,29 +529,11 @@ DWORD LogInitDefault(IN const WCHAR *logName OPTIONAL)
 
     LogReadLevel(); // needs log name
 
-    DWORD status;
-    WCHAR* logPath = malloc(MAX_PATH_LONG_WSIZE);
-    if (!logPath)
-    {
-        // failed, use default location
-        LogInit(NULL, logName);
-        status = ERROR_OUTOFMEMORY;
-        goto end;
-    }
+    // the registry LogDir is read by the rule itself (LogInit -> LogGetDirectory), in one place
+    LogInit(NULL, logName);
 
-    status = CfgReadString(logName, LOG_CONFIG_PATH_VALUE, logPath, MAX_PATH_LONG, NULL);
-    if (ERROR_SUCCESS != status)
-    {
-        LogInit(NULL, logName);
-    }
-    else
-    {
-        LogInit(logPath, logName);
-    }
-
-end:
     LogDebug("Verbosity level set to %d, safe flush: %d", g_LogLevel, g_SafeFlush);
-    return status;
+    return ERROR_SUCCESS;
 }
 
 // create the log file
