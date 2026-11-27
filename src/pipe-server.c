@@ -402,8 +402,39 @@ static DWORD WINAPI QpsReaderThread(
     while (TRUE)
     {
         LogVerbose("[%lld] reading...", client->Id);
+
+        // Only as many bytes as the read buffer has room for are taken from the pipe (AUDIT-qrexec
+        // #20). The rest stay in the pipe, where they hold back the peer's next write until they
+        // are read, so nothing is thrown away for arriving faster than the host reads. While the
+        // buffer is full this thread looks again every 10 ms for QpsRead to have made room, for as
+        // long as the host takes: a client is dropped by a disconnect, not by a clock.
+        UINT64 room = 0;
+        for (;;)
+        {
+            EnterCriticalSection(&client->Lock);
+            room = CmqGetFreeSize(client->ReadBuffer);
+            LeaveCriticalSection(&client->Lock);
+            if (room > 0 || client->Disconnecting)
+                break;
+            Sleep(10);
+        }
+
+        // No read is started once a disconnect is under way.
+        if (client->Disconnecting)
+        {
+            LogDebug("[%lld] client is disconnecting, exiting", client->Id);
+            QpsReleaseClient(server, client);
+            QpsDisconnectClientInternal(server, param->ClientId, FALSE, TRUE);
+            free(param);
+            free(buffer);
+            return 1;
+        }
+
+        if (room > server->PipeBufferSize)
+            room = server->PipeBufferSize;
+
         // A blocked read fails when QpsDisconnectClientInternal cancels the I/O on this handle.
-        if (!ReadFile(pipe, buffer, server->PipeBufferSize, &transferred, NULL)) // this can block
+        if (!ReadFile(pipe, buffer, (DWORD)room, &transferred, NULL)) // this can block
         {
             // WHY THE READ ENDED, instead of one warning for every reason. This pipe protocol has
             // no goodbye message - EOF IS the disconnect (qdb_close just closes the handles, and
@@ -446,7 +477,8 @@ static DWORD WINAPI QpsReaderThread(
 
         if (!CmqAddData(client->ReadBuffer, buffer, transferred))
         {
-            // FIXME: block here until there's space
+            // Not reached while the read above asks for no more than the room it found: only this
+            // thread adds to the read buffer, so that room cannot shrink before the add.
             LeaveCriticalSection(&client->Lock);
             LogError("[%lld] read buffer full", client->Id);
             QpsReleaseClient(server, client);
