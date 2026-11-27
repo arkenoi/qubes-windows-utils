@@ -1028,6 +1028,36 @@ fail_logged:
     return status;
 }
 
+// Hands a connected instance to its own handshake (QpsHandshakeThread), which owns it from then on, so one client
+// never holds the accept loop. A client whose handshake cannot be started - no memory for its record, or no thread
+// for it - is dropped alone, with one error line, and the loop goes on (ADR-qrexec section 3, decision 2): its
+// instance is closed here, and no other instance is touched.
+static void QpsStartHandshake(PIPE_SERVER Server, HANDLE ConnectedPipe)
+{
+    QPS_HANDSHAKE* hs = calloc(1, sizeof(*hs));
+    HANDLE thread;
+    DWORD status;
+
+    if (!hs)
+    {
+        CloseHandle(ConnectedPipe);
+        LogError("no memory for a client's handshake; dropped, the server goes on");
+        return;
+    }
+    hs->Server = Server;
+    hs->WritePipe = ConnectedPipe;
+    thread = CreateThread(NULL, 0, QpsHandshakeThread, hs, 0, NULL);
+    if (!thread)
+    {
+        status = GetLastError();
+        CloseHandle(ConnectedPipe);
+        free(hs);
+        LogError("no thread for a client's handshake (CreateThread: %lu); dropped, the server goes on", status);
+        return;
+    }
+    CloseHandle(thread);
+}
+
 // Returns only on error. At that point the server state is undefined, call QpsDestroy().
 DWORD QpsMainLoop(
     PIPE_SERVER Server
@@ -1038,12 +1068,13 @@ DWORD QpsMainLoop(
 
 // As QpsMainLoop. ListeningEvent, when given, is set once, right after the first instance of the pipe
 // has been created. A caller that starts a client of its own after starting this loop waits on it, so
-// that client's open cannot arrive before the pipe's first instance exists. It says nothing about
-// later moments: a handshake that fails closes its connected instance, and if that close comes before
-// this loop's next CreateNamedPipe the name has no instance for that moment
-// (AUDIT-qrexec #16/#6: the qrexec agent opens its trigger pipe after the hello, then starts
-// advertise-tools, whose qrexec-client-vm opens that pipe). If the loop returns before that point,
-// the event is not set; the caller's wait also watches the thread running the loop.
+// that client's open cannot arrive before the pipe's first instance exists. From then on, while the
+// loop runs, the name always has an instance: the loop creates the next one before it hands a
+// connected one to its handshake (PIPEZEROINSTANCE). (AUDIT-qrexec #16/#6: the qrexec agent opens its
+// trigger pipe after the hello, then starts advertise-tools, whose qrexec-client-vm opens that pipe.)
+// The loop returns only when it cannot create an instance; a client whose handshake cannot be started
+// is dropped alone (QpsStartHandshake). If the loop returns before the first instance exists, the
+// event is not set; the caller's wait also watches the thread running the loop.
 DWORD QpsMainLoopEx(
     PIPE_SERVER Server,
     HANDLE ListeningEvent OPTIONAL
@@ -1064,9 +1095,16 @@ DWORD QpsMainLoopEx(
         LogWarning("called with a %s server; nothing to accept on", Server ? "destroyed" : "NULL");
         return ERROR_INVALID_HANDLE;
     }
-    QPS_HANDSHAKE* hs;
-    HANDLE thread;
+    // The instance a client connected to on the previous pass, not yet handed to its handshake.
+    HANDLE connectedPipe = INVALID_HANDLE_VALUE;
 
+    // ONCE THE FIRST INSTANCE EXISTS, THE NAME ALWAYS HAS ONE (PIPEZEROINSTANCE). Each pass creates the next
+    // instance FIRST and only then hands the client connected on the previous pass to its handshake, which
+    // may close that client's instance at once (a client that left fails there, QpsHandshakeThread). Created
+    // after the hand-off, as it was since fbe86fd, the name could have no instance for that moment: a client's
+    // open then failed at once with "not found" - QpsConnect waits only on ERROR_PIPE_BUSY - and the name was
+    // free for another process to take. An instance that is connected and not yet handed on answers
+    // ERROR_PIPE_BUSY, so a client waits there, as before.
     while (TRUE)
     {
         writePipe = CreateNamedPipe(Server->PipeName,
@@ -1077,9 +1115,16 @@ DWORD QpsMainLoopEx(
                                     Server->PipeBufferSize,
                                     0,
                                     Server->SecurityAttributes);
-        // The one pipe this loop cannot go on without (ADR-qrexec section 3, decision 2).
+        // The one pipe this loop cannot go on without (ADR-qrexec section 3, decision 2). A client connected
+        // on the previous pass is still handed to its handshake first, which does not need this loop - as at
+        // fbe86fd, where it had been handed on before this create.
         if (writePipe == INVALID_HANDLE_VALUE)
-            return win_perror("CreateNamedPipe(outbound)");
+        {
+            status = win_perror("CreateNamedPipe(outbound)");
+            if (connectedPipe != INVALID_HANDLE_VALUE)
+                QpsStartHandshake(Server, connectedPipe);
+            return status;
+        }
 
         // The pipe's first instance exists here, so a client's open finds it even before the connect
         // below. Told once.
@@ -1087,6 +1132,14 @@ DWORD QpsMainLoopEx(
         {
             SetEvent(ListeningEvent);
             ListeningEvent = NULL;
+        }
+
+        if (connectedPipe != INVALID_HANDLE_VALUE)
+        {
+            // The rest of this client's handshake is its own thread's. If it cannot be started, that client
+            // alone is dropped and the loop goes on with the instance just created as its listener.
+            QpsStartHandshake(Server, connectedPipe);
+            connectedPipe = INVALID_HANDLE_VALUE;
         }
 
         // wait for connection
@@ -1104,25 +1157,8 @@ DWORD QpsMainLoopEx(
         } while (!connected);
 
         LogVerbose("outbound pipe connected");
-        // The rest of this client's handshake is its own thread's (QpsHandshakeThread): one client never holds the
-        // accept loop. Resource failures here end the loop as before.
-        hs = calloc(1, sizeof(*hs));
-        if (!hs)
-        {
-            CloseHandle(writePipe);
-            return ERROR_NOT_ENOUGH_MEMORY;
-        }
-        hs->Server = Server;
-        hs->WritePipe = writePipe;
-        thread = CreateThread(NULL, 0, QpsHandshakeThread, hs, 0, NULL);
-        if (!thread)
-        {
-            status = win_perror("CreateThread(pipe handshake)");
-            CloseHandle(writePipe);
-            free(hs);
-            return status;
-        }
-        CloseHandle(thread);
+        // Handed on at the top of the next pass, after the instance that replaces it as the listener exists.
+        connectedPipe = writePipe;
     }
 }
 
