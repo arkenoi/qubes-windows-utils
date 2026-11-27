@@ -768,13 +768,16 @@ static void QpsDisconnectClientInternal(
         return;
     }
 
-    if (client->Disconnecting)
+    // Test and set in one step (AUDIT-qrexec #27): of two threads that disconnect the same client -
+    // the reader on its end-of-file and the host, say - exactly one goes on to the teardown below
+    // and the other returns here. Tested and then set, both could pass the test and both run it:
+    // four handles closed twice and the disconnect callback delivered twice.
+    if (InterlockedExchange((LONG *)&client->Disconnecting, TRUE))
     {
         QpsReleaseClient(Server, client);
         return;
     }
 
-    client->Disconnecting = TRUE;
     LogInfo("[%lld] (%p) disconnecting, WriterExiting %d, ReaderExiting %d", ClientId, client, WriterExiting, ReaderExiting);
 
     if (!WriterExiting)
