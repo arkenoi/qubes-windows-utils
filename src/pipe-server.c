@@ -272,6 +272,11 @@ static PPIPE_CLIENT QpsGetClientRaw(
         if (client->Id == ClientId)
         {
             returnClient = client;
+            // The reference is taken under the list lock. The last release unlinks and frees the client
+            // under this same lock (QpsReleaseClient), so that cannot happen between the find and the
+            // count (AUDIT-qrexec #28).
+            if (IncreaseRefcount)
+                InterlockedIncrement(&returnClient->RefCount);
             break;
         }
 
@@ -281,8 +286,6 @@ static PPIPE_CLIENT QpsGetClientRaw(
 
     if (returnClient)
     {
-        if (IncreaseRefcount)
-            InterlockedIncrement(&returnClient->RefCount);
         LogVerbose("[%lld] (%p) refs: %ld", returnClient->Id, returnClient, returnClient->RefCount);
     }
     else
