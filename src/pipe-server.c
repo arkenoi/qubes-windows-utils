@@ -1329,25 +1329,24 @@ DWORD QpsConnect(
     }
     writePipeName[cbWritePipeName/2] = L'0';
 
-    // Try to open the write pipe; wait for it, if necessary.
-    do
-    {
-        LogDebug("opening write pipe: %s", writePipeName);
-        *WritePipe = CreateFile(writePipeName,
-                                GENERIC_WRITE, // this is an outbound pipe
-                                0,
-                                NULL,
-                                OPEN_EXISTING,
-                                0,
-                                NULL);
+    // Open the write pipe once (AUDIT-qrexec #22). The server creates it before it sends its name,
+    // so a pipe that is not found will not appear later: the server has given this client up or
+    // has gone away. The open is made once and its failure is the answer.
+    LogDebug("opening write pipe: %s", writePipeName);
+    *WritePipe = CreateFile(writePipeName,
+                            GENERIC_WRITE, // this is an outbound pipe
+                            0,
+                            NULL,
+                            OPEN_EXISTING,
+                            0,
+                            NULL);
 
-        // This pipe may be not created yet
-        status = GetLastError();
-        if ((*WritePipe == INVALID_HANDLE_VALUE) && (ERROR_FILE_NOT_FOUND != status))
-            return win_perror2(status, "open write pipe");
+    status = GetLastError();
+    if (*WritePipe == INVALID_HANDLE_VALUE)
+        return win_perror2(status, "open write pipe");
 
-        Sleep(10);
-    } while (*WritePipe == INVALID_HANDLE_VALUE);
+    // The server gets 10 ms to see this connection before the caller's first write.
+    Sleep(10);
 
     return ERROR_SUCCESS;
 }
