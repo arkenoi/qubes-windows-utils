@@ -757,8 +757,10 @@ static void _LogFormatUnlocked(IN int level, IN BOOL raw, IN const char *functio
             GetCurrentProcessId(), GetCurrentThreadId(), g_LogLevelChar[level], functionName);
     }
 
-    // format buffer
-    bufferSize = vswprintf_s(g_Buffer, LOG_MAX_MESSAGE_LENGTH, format, args) * sizeof(WCHAR);
+    // Format the message (AUDIT-qrexec 7.7). One that does not fit the buffer is cut to what fits:
+    // without _TRUNCATE the formatter treats it as an invalid parameter, which ends the process.
+    // The length it returns is not needed: ConvertUTF16ToUTF8 below writes bufferSize.
+    _vsnwprintf_s(g_Buffer, LOG_MAX_MESSAGE_LENGTH, _TRUNCATE, format, args);
 
     if (!raw)
     {
