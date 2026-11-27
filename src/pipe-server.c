@@ -1078,40 +1078,38 @@ DWORD QpsRead(
     )
 {
     UINT64 size;
-    UINT64 pending = 0;
-    BOOL ret;
+    DWORD received = 0;
+    BOOL disconnecting;
     PPIPE_CLIENT client = QpsGetClient(Server, ClientId);
 
     LogVerbose("[%lld] size %lu", ClientId, DataSize);
     if (!client)
         return ERROR_NOT_CONNECTED;
 
-    // get data from the read buffer until the requested amount is read
-    do
+    // Take what the read buffer holds, piece by piece, until the requested amount has arrived
+    // (AUDIT-qrexec #2). What is taken makes room for the reader thread to add more, so a request
+    // may be larger than the buffer: the qrexec agent's buffer is 4096 bytes and it accepts a
+    // command line of up to 65536.
+    while (received < DataSize)
     {
-        // get data from the read buffer if available
-        size = DataSize;
-        EnterCriticalSection(&client->Lock);
-        ret = CmqGetData(client->ReadBuffer, Data, &size, CMQ_NO_UNDERFLOW);
-        // HOW MUCH IS ACTUALLY BUFFERED, read under the SAME lock that guarded the get above, and
-        // that is the whole point. This used to be read after LeaveCriticalSection, racing the
-        // reader thread that appends to this very buffer - so the two observations described
-        // different instants and could not both be true.
-        // MEASURED 2026-10-26, acceptance run 40297264818 cell win10-upgrade, qrexec-agent
-        // 4.3.37.1123: "QpsRead: [3] peer gone mid-message: 426 of 0 bytes" on the magic read,
-        // which is QpsRead(&magic, sizeof(UINT32)) - FOUR bytes (qrexec-agent.c:1478). CmqGetData
-        // with CMQ_NO_UNDERFLOW can only fail if fewer than 4 bytes are buffered, so "426 pending"
-        // and "a 4-byte read underflowed" cannot both describe one instant. The unlocked read saw
-        // the reader thread's append land afterwards and reported it as evidence of a truncated
-        // message. An ERROR that convicts the product has to be coherent first.
-        pending = CmqGetUsedSize(client->ReadBuffer);
-        LeaveCriticalSection(&client->Lock);
+        // The flag is sampled BEFORE the buffer is looked at. A reader thread that finds the peer
+        // gone has added everything it read before it sets the flag, so a flag already set here
+        // means the look below sees all this client delivered. A flag that is set after the look
+        // is acted on in the next pass, after another look.
+        disconnecting = client->Disconnecting;
 
-        if (!ret)
+        // Never zero inside this loop, and it must not be: zero asks CmqGetData for everything.
+        size = DataSize - received;
+        EnterCriticalSection(&client->Lock);
+        CmqGetData(client->ReadBuffer, (BYTE *)Data + received, &size, CMQ_ALLOW_UNDERFLOW);
+        LeaveCriticalSection(&client->Lock);
+        received += (DWORD)size;
+
+        if (received < DataSize)
         {
             // If there's not enough data and the client is disconnecting,
             // that means we'll never have enough data: abort.
-            if (client->Disconnecting)
+            if (disconnecting)
             {
                 // HOW MUCH WAS PENDING decides what this is. Nothing pending = the consumer was
                 // between messages and the peer is gone: the ordinary end of a session. Some but
@@ -1121,20 +1119,17 @@ DWORD QpsRead(
                 // the case that matters. The ERROR_BROKEN_PIPE return is unchanged either way, so
                 // no caller's control flow moves.
                 QpsReleaseClient(Server, client);
-                if (pending == 0)
+                if (received == 0)
                     LogDebug("[%lld] peer gone, nothing pending", ClientId);
                 else
-                    // DataSize, NOT `size`: CmqGetData sets *dataSize = 0 on EVERY failure path before
-                    // returning FALSE (buffer.c, the underflow and empty-buffer branches), so `size`
-                    // is always 0 here and "of 0 bytes" was a destroyed argument, never a measurement.
-                    // DataSize is the IN parameter and is never written.
-                    LogError("[%lld] peer gone mid-message: %llu of %lu bytes", ClientId, pending, DataSize);
+                    // The two counts are what this call took and what it was asked for.
+                    LogError("[%lld] peer gone mid-message: %llu of %lu bytes", ClientId, (UINT64)received, DataSize);
                 return ERROR_BROKEN_PIPE;
             }
 
             Sleep(1); // don't congest the lock
         }
-    } while (!ret);
+    }
 
     QpsReleaseClient(Server, client);
     return ERROR_SUCCESS;
