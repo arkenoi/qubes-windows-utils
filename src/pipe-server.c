@@ -1033,6 +1033,22 @@ DWORD QpsMainLoop(
     PIPE_SERVER Server
     )
 {
+    return QpsMainLoopEx(Server, NULL);
+}
+
+// As QpsMainLoop. ListeningEvent, when given, is set once, right after the first instance of the pipe
+// has been created. A caller that starts a client of its own after starting this loop waits on it, so
+// that client's open cannot arrive before the pipe's first instance exists. It says nothing about
+// later moments: a handshake that fails closes its connected instance, and if that close comes before
+// this loop's next CreateNamedPipe the name has no instance for that moment
+// (AUDIT-qrexec #16/#6: the qrexec agent opens its trigger pipe after the hello, then starts
+// advertise-tools, whose qrexec-client-vm opens that pipe). If the loop returns before that point,
+// the event is not set; the caller's wait also watches the thread running the loop.
+DWORD QpsMainLoopEx(
+    PIPE_SERVER Server,
+    HANDLE ListeningEvent OPTIONAL
+    )
+{
     BOOL connected;
     HANDLE writePipe;
     DWORD status;
@@ -1064,6 +1080,14 @@ DWORD QpsMainLoop(
         // The one pipe this loop cannot go on without (ADR-qrexec section 3, decision 2).
         if (writePipe == INVALID_HANDLE_VALUE)
             return win_perror("CreateNamedPipe(outbound)");
+
+        // The pipe's first instance exists here, so a client's open finds it even before the connect
+        // below. Told once.
+        if (ListeningEvent)
+        {
+            SetEvent(ListeningEvent);
+            ListeningEvent = NULL;
+        }
 
         // wait for connection
         do

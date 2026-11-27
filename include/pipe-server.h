@@ -121,6 +121,15 @@ DWORD QpsMainLoop(
     PIPE_SERVER Server
     );
 
+// As QpsMainLoop, and sets ListeningEvent (when not NULL) once, right after the pipe's first instance
+// exists, so that a caller can start a client of its own only after that first instance exists. The
+// event is not set if the loop returns before that point: wait on the loop's thread as well.
+WINDOWSUTILS_API
+DWORD QpsMainLoopEx(
+    PIPE_SERVER Server,
+    HANDLE ListeningEvent OPTIONAL
+    );
+
 // Blocking read from a client.
 // Returns immediately if the internal read queue has enough data.
 WINDOWSUTILS_API
