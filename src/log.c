@@ -214,6 +214,124 @@ static WCHAR *LogGetName(void)
     return g_LogName;
 }
 
+// The event ids this process holds a claim on: one it wrote this boot, or one it is writing now. Every call asks
+// here FIRST, on both paths (the per-boot key, or the once-per-process fallback when the key cannot be made), so
+// one process writes an id at most once a boot. The whole table is read under the lock before a slot is taken.
+// Two ids are in use; an id that finds every slot taken is not written - a bound, not a flood.
+#define APPEVENT_PROCESS_SLOTS 4
+static LONG g_AppEventClaimed[APPEVENT_PROCESS_SLOTS];
+static SRWLOCK g_AppEventLock = SRWLOCK_INIT;
+
+// The slot this call claimed for eventId; -1 when this process already holds a claim on it, or no slot is free.
+static int AppEventClaimInProcess(IN DWORD eventId)
+{
+    int slot = -1;
+    BOOL held = FALSE;
+
+    AcquireSRWLockExclusive(&g_AppEventLock);
+    for (int i = 0; i < APPEVENT_PROCESS_SLOTS; i++)
+    {
+        if (g_AppEventClaimed[i] == (LONG)eventId)
+            held = TRUE;
+        else if (g_AppEventClaimed[i] == 0 && slot < 0)
+            slot = i;
+    }
+    if (held)
+        slot = -1;
+    else if (slot >= 0)
+        g_AppEventClaimed[slot] = (LONG)eventId;
+    ReleaseSRWLockExclusive(&g_AppEventLock);
+    return slot;
+}
+
+static void AppEventReleaseInProcess(IN int slot)
+{
+    AcquireSRWLockExclusive(&g_AppEventLock);
+    g_AppEventClaimed[slot] = 0;
+    ReleaseSRWLockExclusive(&g_AppEventLock);
+}
+
+BOOL LogAppEventFirstInBoot(IN DWORD eventId, IN const WCHAR *text, IN const WCHAR *detail OPTIONAL)
+{
+    WCHAR keyPath[128];
+    WCHAR pid[16];
+    const WCHAR *name;
+    const WCHAR *strings[4];
+    HKEY key = NULL;
+    DWORD disposition = 0;
+    BOOL claimedKey = FALSE;
+    int slot;
+    HANDLE source;
+    BOOL ok = FALSE;
+    LSTATUS status;
+    // A logger leaves the caller's last error as it found it, as _LogFormat does.
+    DWORD lastError = GetLastError();
+
+    if (FAILED(StringCchPrintfW(keyPath, RTL_NUMBER_OF(keyPath),
+        L"SOFTWARE\\Invisible Things Lab\\Qubes Tools\\AppEventThisBoot\\%lu", eventId)))
+        return FALSE;
+
+    slot = AppEventClaimInProcess(eventId);
+    if (slot < 0)
+        return FALSE;                                       // this process has written it, or is writing it now
+
+    // KEY_WOW64_64KEY: one key for every caller whatever its bitness (HKLM\SOFTWARE is redirected for a 32-bit one).
+    status = RegCreateKeyExW(HKEY_LOCAL_MACHINE, keyPath, 0, NULL, REG_OPTION_VOLATILE,
+        KEY_READ | KEY_WRITE | KEY_WOW64_64KEY, NULL, &key, &disposition);
+    if (status == ERROR_SUCCESS)
+    {
+        RegCloseKey(key);
+        if (disposition != REG_CREATED_NEW_KEY)
+        {
+            // This boot has the record, or another process is writing it. The claim is given back rather than
+            // kept: if that write fails its key is removed, and this process's next occurrence must try again.
+            AppEventReleaseInProcess(slot);
+            goto done;
+        }
+        claimedKey = TRUE;
+    }
+    else
+    {
+        win_perror2(status, "RegCreateKeyExW(AppEventThisBoot) - the record is written once per process instead");
+    }
+
+    name = LogGetName();
+    StringCchPrintfW(pid, RTL_NUMBER_OF(pid), L"%lu", GetCurrentProcessId());
+    strings[0] = text ? text : L"";
+    strings[1] = name ? name : L"?";
+    strings[2] = pid;
+    strings[3] = detail ? detail : L"";
+
+    source = RegisterEventSourceW(NULL, LOG_APPEVENT_SOURCE);
+    if (!source)
+    {
+        win_perror("RegisterEventSourceW(" LOG_APPEVENT_SOURCE L")");
+        ok = FALSE;
+    }
+    else
+    {
+        ok = ReportEventW(source, EVENTLOG_ERROR_TYPE, 0, eventId, NULL, (WORD)RTL_NUMBER_OF(strings), 0, strings, NULL);
+        if (!ok)
+            win_perror("ReportEventW");
+        DeregisterEventSource(source);
+    }
+
+    // Not written: give both claims back, so the next occurrence in this boot tries again.
+    if (!ok)
+    {
+        AppEventReleaseInProcess(slot);
+        if (claimedKey)
+        {
+            status = RegDeleteKeyExW(HKEY_LOCAL_MACHINE, keyPath, KEY_WOW64_64KEY, 0);
+            if (status != ERROR_SUCCESS)
+                win_perror2(status, "RegDeleteKeyExW(AppEventThisBoot) - this boot records no further attempt");
+        }
+    }
+done:
+    SetLastError(lastError);
+    return ok;
+}
+
 // Read verbosity level from registry config.
 // This should not call LogXXX to avoid infinite loop.
 static void LogReadLevel(void)

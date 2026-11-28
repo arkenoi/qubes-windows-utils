@@ -108,6 +108,28 @@ void LogSetLevel(IN int level);
 WINDOWSUTILS_API
 int LogGetLevel(void);
 
+// OUR APPLICATION-LOG SOURCE. The installer registers it (Install-QwtImproved.ps1 Register-QwtEventSource) with the
+// .NET Framework's EventLogMessages.dll, whose every message renders "%1", so the first string is the text. The
+// agent's supervisors write 4001-4004 (a child died) and 4011-4014 (a child ended with the session) under it
+// (agent include/deathevent.h). guest/qwt-report-death.ps1 reports 4001-4004 and the two ids below to dom0;
+// 4011-4014 are recorded and not reported.
+#define LOG_APPEVENT_SOURCE L"Qubes Windows Tools"
+// The qrexec agent's connection table is full: calls are stuck and no longer tracked (ADR-qrexec 3, point 1).
+#define LOG_APPEVENT_QREXEC_TABLE_FULL      4021
+// A pipe server dropped a client it had no memory or no thread for (ADR-qrexec 3, point 2).
+#define LOG_APPEVENT_PIPE_CLIENT_DROPPED    4022
+
+// Writes ONE Application-log record of LOG_APPEVENT_SOURCE, at ERROR, the first time in a boot that any process
+// calls this with eventId, and nothing on every later call in that boot. "First in a boot" is the creation of a
+// volatile registry key (HKLM\SOFTWARE\Invisible Things Lab\Qubes Tools\AppEventThisBoot\<id>), which the kernel
+// discards at shutdown and which exactly one caller can create. The strings: %1 text, %2 this module's log name,
+// %3 its pid, %4 detail. A record the Event Log refuses gives up the claim, so the next call tries again. When the
+// key can be neither created nor opened, the record is written once per process instead. One process writes an id
+// at most once a boot, whichever way. Every failure is one error line; the caller's last error is left as it was.
+// It calls the registry and the Event Log service: call it with no lock held. Returns TRUE iff this call wrote it.
+WINDOWSUTILS_API
+BOOL LogAppEventFirstInBoot(IN DWORD eventId, IN const WCHAR *text, IN const WCHAR *detail OPTIONAL);
+
 // Enter the global logger lock (use with *raw macros).
 WINDOWSUTILS_API
 void LogLock();

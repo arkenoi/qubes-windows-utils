@@ -1028,10 +1028,24 @@ fail_logged:
     return status;
 }
 
+// The first client in a boot that a pipe server drops for want of memory or a thread is also written to the
+// Application log (ADR-qrexec 3, point 2), which the death reporter sends to dom0 as an ACTION notice: the qube is
+// out of memory and refused a call made inside it. Every later one in that boot is its error line alone. Both
+// servers of this loop write it: the qrexec agent's trigger pipe and the qubesdb daemon's pipe.
+static void QpsReportDropped(PIPE_SERVER Server, const WCHAR *why)
+{
+    WCHAR detail[320];
+
+    StringCchPrintfW(detail, RTL_NUMBER_OF(detail), L"pipe %s: %s", Server->PipeName, why);
+    LogAppEventFirstInBoot(LOG_APPEVENT_PIPE_CLIENT_DROPPED,
+        L"A call made inside the qube was refused: the qube is out of memory. Its pipe server had no memory or no "
+        L"thread for the caller and dropped it; the server goes on.", detail);
+}
+
 // Hands a connected instance to its own handshake (QpsHandshakeThread), which owns it from then on, so one client
 // never holds the accept loop. A client whose handshake cannot be started - no memory for its record, or no thread
-// for it - is dropped alone, with one error line, and the loop goes on (ADR-qrexec section 3, decision 2): its
-// instance is closed here, and no other instance is touched.
+// for it - is dropped alone, with one error line (and, the first in a boot, QpsReportDropped's record), and the loop
+// goes on (ADR-qrexec section 3, decision 2): its instance is closed here, and no other instance is touched.
 static void QpsStartHandshake(PIPE_SERVER Server, HANDLE ConnectedPipe)
 {
     QPS_HANDSHAKE* hs = calloc(1, sizeof(*hs));
@@ -1042,6 +1056,7 @@ static void QpsStartHandshake(PIPE_SERVER Server, HANDLE ConnectedPipe)
     {
         CloseHandle(ConnectedPipe);
         LogError("no memory for a client's handshake; dropped, the server goes on");
+        QpsReportDropped(Server, L"no memory for the client's handshake");
         return;
     }
     hs->Server = Server;
@@ -1053,6 +1068,7 @@ static void QpsStartHandshake(PIPE_SERVER Server, HANDLE ConnectedPipe)
         CloseHandle(ConnectedPipe);
         free(hs);
         LogError("no thread for a client's handshake (CreateThread: %lu); dropped, the server goes on", status);
+        QpsReportDropped(Server, L"no thread for the client's handshake");
         return;
     }
     CloseHandle(thread);
