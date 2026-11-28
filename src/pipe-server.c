@@ -109,6 +109,13 @@ static void QpsDisconnectClientInternal(
     IN  BOOL ReaderExiting
     );
 
+// The pipe behind Pipe is owned by LocalSystem or Administrators; otherwise one error line ending in Refused.
+static DWORD QpsServerIsTrusted(
+    IN  HANDLE Pipe,
+    IN  PWCHAR PipeName,
+    IN  const WCHAR *Refused
+    );
+
 // Create the server.
 DWORD QpsCreate(
     IN  PWCHAR PipeName, // This is a client->server pipe name (clients write, server reads). server->client pipes have "-%PID%" appended.
@@ -1273,24 +1280,29 @@ DWORD QpsMainLoopEx(
     // free for another process to take. An instance that is connected and not yet handed on answers
     // ERROR_PIPE_BUSY, so a client waits there, as before.
     //
-    // A SERVER WITH A MAIN-PIPE DESCRIPTOR OF ITS OWN (QpsCreate, fix B steps 1 and 5: the qrexec agent) creates its
-    // first instance with FILE_FLAG_FIRST_PIPE_INSTANCE. A name that already exists when this loop starts - created by
-    // another process before the server, to take its callers - then fails that create with ERROR_ACCESS_DENIED and the
-    // loop returns, where it could add an instance beside the other one's and share the callers with it. An instance
-    // from an earlier run of this server lives on while a client still holds it ("An instance of a named pipe is always
-    // deleted when the last handle to the instance of the named pipe is closed", CreateNamedPipe); whether such an
-    // instance also fails this create is not documented and not measured - if it does, a restarted server fails the
-    // same way until that client has closed (qrexec-client-vm closes when its read of the main pipe breaks). Later
-    // passes create without the flag, which would refuse them. A server without its own descriptor (the
-    // qubesdb daemon) creates as before: its clients hold their pipes for a connection's life, and its restart is not
-    // to depend on all of them having gone (the review of wf_212a17bd-b58).
+    // A SERVER WITH A MAIN-PIPE DESCRIPTOR OF ITS OWN (QpsCreate, fix B steps 1 and 5: the qrexec agent) SERVES ONLY A
+    // NAME THAT LOCALSYSTEM OR ADMINISTRATORS OWN. After its first create it reads the owner of the pipe it got - an
+    // existing name's own: the descriptor is the pipe's, and lpSecurityAttributes defines it only "If a new named pipe
+    // is being created" (CreateNamedPipe; Named Pipe Security and Access Rights: a create on "an existing named pipe"
+    // is checked "against the DACL in the named pipe's security descriptor") - and accepts S-1-5-18 or
+    // S-1-5-32-544 only, QpsConnect's rule. Anything else is a name another process created first, to take this server's
+    // callers: that instance is closed and the loop returns with one error line naming the owner.
+    // Not FILE_FLAG_FIRST_PIPE_INSTANCE, which bc7c7df used and the Opus audit of it refuted (fix B audit, Finding 1).
+    // Any process may open the main pipe (Everyone FILE_GENERIC_READ) and hold the handle, and "An instance of a named
+    // pipe is always deleted when the last handle to the instance of the named pipe is closed" (CreateNamedPipe). So a
+    // non-admin holding an instance of this server's previous run - across an SCM recovery restart or an MSI upgrade's
+    // service restart - made the restarted server's first-instance create fail. Such a leftover is owned by SYSTEM (this
+    // descriptor) or, from an agent before fix B, by Administrators (exec.c's descriptor sets no owner; measured
+    // S-1-5-32-544 on 4.3.47.1579), so it is served on, and its DACL is not required to be this one. A process that is
+    // neither LocalSystem nor an administrator cannot create a pipe with either owner, so this does not let one take the
+    // name. A server without its own descriptor (the qubesdb daemon) creates as before (the review of wf_212a17bd-b58).
     PSECURITY_ATTRIBUTES mainPipeAttributes =
         Server->MainPipeAttributes.lpSecurityDescriptor ? &Server->MainPipeAttributes : Server->SecurityAttributes;
-    DWORD firstInstance = Server->MainPipeAttributes.lpSecurityDescriptor ? FILE_FLAG_FIRST_PIPE_INSTANCE : 0;
+    BOOL checkOwner = Server->MainPipeAttributes.lpSecurityDescriptor != NULL;
     while (TRUE)
     {
         writePipe = CreateNamedPipe(Server->PipeName,
-                                    PIPE_ACCESS_OUTBOUND | firstInstance,
+                                    PIPE_ACCESS_OUTBOUND,
                                     PIPE_TYPE_BYTE | PIPE_WAIT,
                                     PIPE_UNLIMITED_INSTANCES,
                                     Server->PipeBufferSize,
@@ -1302,14 +1314,23 @@ DWORD QpsMainLoopEx(
         // fbe86fd, where it had been handed on before this create.
         if (writePipe == INVALID_HANDLE_VALUE)
         {
-            // One line either way; the first names its flag, so error 5 there reads as a name that existed already.
-            status = firstInstance ? win_perror("CreateNamedPipe(outbound, first instance)")
-                                   : win_perror("CreateNamedPipe(outbound)");
+            status = win_perror("CreateNamedPipe(outbound)");
             if (connectedPipe != INVALID_HANDLE_VALUE)
                 QpsStartHandshake(Server, connectedPipe);
             return status;
         }
-        firstInstance = 0;
+        if (checkOwner)
+        {
+            // First pass only, so no client is connected yet and none is waiting to be handed on.
+            status = QpsServerIsTrusted(writePipe, Server->PipeName,
+                                        L"another process created this name first; not served");
+            if (status != ERROR_SUCCESS)
+            {
+                CloseHandle(writePipe);
+                return status;
+            }
+            checkOwner = FALSE;
+        }
 
         // The pipe's first instance exists here, so a client's open finds it even before the connect
         // below. Told once.
@@ -1562,11 +1583,15 @@ DWORD QpsGetClientToken(
 // A process that is neither, and holds no SeRestorePrivilege, cannot give an object either owner, so a name it took
 // first is refused here, before this client reads the name it sends or hands it anything. An administrator's process
 // passes only when the pipe it created is owned by Administrators, which its token's default owner decides; that was
-// not measured, for an elevated token or a filtered one. GENERIC_READ
-// carries READ_CONTROL, which reading the owner needs (GetSecurityInfo). One error line on a refusal, with the owner.
+// not measured, for an elevated token or a filtered one. MEASURED on win11-fixa (4.3.47.1579, fix A without fix B),
+// 2026-11-28: \\.\pipe\qubesdb.sock and \\.\pipe\qrexec_trigger are both owned by S-1-5-32-544, read as SYSTEM, as
+// the console user and as a standard user, so both servers pass. GENERIC_READ (a client) and PIPE_ACCESS_OUTBOUND (the
+// server's own handle, QpsMainLoopEx) carry READ_CONTROL, which reading the owner needs (GetSecurityInfo). One error
+// line on a refusal, with the owner and what is refused.
 static DWORD QpsServerIsTrusted(
     IN  HANDLE Pipe,
-    IN  PWCHAR PipeName
+    IN  PWCHAR PipeName,
+    IN  const WCHAR *Refused
     )
 {
     PSID owner = NULL;
@@ -1576,15 +1601,15 @@ static DWORD QpsServerIsTrusted(
 
     status = GetSecurityInfo(Pipe, SE_KERNEL_OBJECT, OWNER_SECURITY_INFORMATION, &owner, NULL, NULL, NULL, &descriptor);
     if (status != ERROR_SUCCESS)
-        return win_perror2(status, "reading the owner of the server's pipe");
+        return win_perror2(status, "reading the owner of the pipe");
     if (owner && (IsWellKnownSid(owner, WinLocalSystemSid) || IsWellKnownSid(owner, WinBuiltinAdministratorsSid)))
         status = ERROR_SUCCESS;
     else
     {
         if (owner && !ConvertSidToStringSidW(owner, &ownerText))
             ownerText = NULL;
-        LogError("pipe %s is owned by %s, neither LocalSystem nor Administrators: not connected", PipeName,
-                 ownerText ? ownerText : L"(no owner)");
+        LogError("pipe %s is owned by %s, neither LocalSystem nor Administrators: %s", PipeName,
+                 ownerText ? ownerText : L"(no owner)", Refused);
         status = ERROR_ACCESS_DENIED;
     }
     LocalFree(ownerText);
@@ -1647,7 +1672,7 @@ DWORD QpsConnect(
     // closed it and left it set; the invalid-size return left it open.
 
     // Nothing is read from a server that is not LocalSystem's or an administrator's, and nothing is sent to it.
-    status = QpsServerIsTrusted(*ReadPipe, PipeName);
+    status = QpsServerIsTrusted(*ReadPipe, PipeName, L"not connected");
     if (status != ERROR_SUCCESS)
         goto fail;
 
