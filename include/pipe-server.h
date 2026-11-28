@@ -206,7 +206,8 @@ DWORD QpsGetClientToken(
     OUT HANDLE *Token
     );
 
-// Client API: connect to a server.
+// Client API: connect to a server. The per-client pipe is opened with SECURITY_SQOS_PRESENT | SECURITY_IMPERSONATION:
+// impersonation level, static tracking (the opener's identity, taken at the open), not effective-only (the whole token).
 WINDOWSUTILS_API
 DWORD QpsConnect(
     IN  PWCHAR PipeName,

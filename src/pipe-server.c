@@ -364,7 +364,8 @@ the whole buffer is read. The read will return once *something* is written to th
 // THE CLIENT'S IDENTITY, FROM THE PIPE ITS BYTES CAME IN ON (fix A, ADR-qrexec 7.2). Called by the reader thread right
 // after the first read from a client's inbound pipe completes: ImpersonateNamedPipeClient takes "the security
 // context of the last message read from the pipe", and before any read it fails ERROR_CANNOT_IMPERSONATE ("Unable to
-// impersonate using a named pipe until data has been read from that pipe", System Error Codes 1300-1699). The reader
+// impersonate using a named pipe until data has been read from that pipe", System Error Codes 1300-1699). With the
+// static tracking QpsConnect asks for, that context is the snapshot taken when the client opened the pipe. The reader
 // is the only thread doing I/O on that synchronous handle, so the request is not queued behind a blocking read.
 // Nothing else runs on this thread between the impersonation and the revert: no log line, no file I/O. A client
 // below impersonation level is refused (ERROR_BAD_IMPERSONATION_LEVEL), never taken for LocalSystem. A LocalSystem
@@ -1553,13 +1554,21 @@ DWORD QpsConnect(
     // Open the write pipe once (AUDIT-qrexec #22). The server creates it before it sends its name,
     // so a pipe that is not found will not appear later: the server has given this client up or
     // has gone away. The open is made once and its failure is the answer.
+    // WHAT THIS CLIENT HANDS THE SERVER (fix A, ADR-qrexec 7.2). A server that takes its clients' identities
+    // (QpsEnableClientTokens) runs the client's program on the token it gets from this pipe, so the quality of
+    // service is stated, not left to whatever the system uses when SECURITY_SQOS_PRESENT is absent (CreateFile's
+    // page does not say). CreateFile: SECURITY_IMPERSONATION "Impersonate a client at the impersonation level";
+    // SECURITY_CONTEXT_TRACKING omitted, so "the security tracking mode is static" - "a snapshot of the client's
+    // security context" (SECURITY_QUALITY_OF_SERVICE), taken at this open, so the identity is the opener's and not
+    // whichever thread wrote last; SECURITY_EFFECTIVE_ONLY omitted, so "all aspects of the client's security context
+    // are available", and the program gets the caller's whole token, its disabled privileges and groups included.
     LogDebug("opening write pipe: %s", writePipeName);
     *WritePipe = CreateFile(writePipeName,
                             GENERIC_WRITE, // this is an outbound pipe
                             0,
                             NULL,
                             OPEN_EXISTING,
-                            0,
+                            SECURITY_SQOS_PRESENT | SECURITY_IMPERSONATION,
                             NULL);
 
     status = GetLastError();
