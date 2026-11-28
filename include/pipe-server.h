@@ -94,9 +94,15 @@ typedef void(*QPS_DATA_RECEIVED)(struct _PIPE_SERVER *Server, LONGLONG Id, PVOID
 // All functions return an error code unless specified otherwise.
 
 // Create the server.
+// WHO MAY SERVE ITS PIPES (fix B, PUBLICPIPECREATEINSTANCE). Each client's own pipe is named
+// "<PipeName>-<pid>-<id>-<32 random hex digits>", is created with FILE_FLAG_FIRST_PIPE_INSTANCE and has one instance at
+// most; it takes SecurityAttributes. A server created WITH SecurityAttributes (the qrexec agent) gives its main pipe a
+// descriptor of its own - owner SYSTEM, SYSTEM full control, Everyone FILE_GENERIC_READ - and creates that pipe's first
+// instance with FILE_FLAG_FIRST_PIPE_INSTANCE, so QpsMainLoopEx returns ERROR_ACCESS_DENIED at once if the name already
+// exists. One created with NULL (the qubesdb daemon) keeps the default descriptor on its main pipe, and no flag.
 WINDOWSUTILS_API
 DWORD QpsCreate(
-    IN  PWCHAR PipeName, // This is a client->server pipe name (clients write, server reads). server->client pipes have "-%PID%" appended.
+    IN  PWCHAR PipeName, // The main pipe's name (the server writes, clients read). Each client's own pipe (it writes, the server reads) is this name with "-<pid>-<id>-<32 hex digits>" appended.
     IN  DWORD PipeBufferSize, // Pipe read/write buffer size. Shouldn't be too big.
     IN  DWORD ReadBufferSize, // Read buffer (per client). The server enqueues all received data here until it's read by QpsRead().
     IN  DWORD WriteTimeout, // If a client doesn't read written data in this amount of milliseconds, it's disconnected.
@@ -208,6 +214,10 @@ DWORD QpsGetClientToken(
 
 // Client API: connect to a server. The per-client pipe is opened with SECURITY_SQOS_PRESENT | SECURITY_IMPERSONATION:
 // impersonation level, static tracking (the opener's identity, taken at the open), not effective-only (the whole token).
+// Before that (fix B): the main pipe is opened at identification level; a main pipe whose owner is neither LocalSystem
+// nor Administrators is refused (ERROR_ACCESS_DENIED); a per-client name that is not "<PipeName>-..." with no further
+// backslash is refused (ERROR_INVALID_DATA). On any failure nothing is left open and both handles are
+// INVALID_HANDLE_VALUE, and the result is also the thread's last error.
 WINDOWSUTILS_API
 DWORD QpsConnect(
     IN  PWCHAR PipeName,

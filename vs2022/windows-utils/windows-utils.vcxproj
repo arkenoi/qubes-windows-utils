@@ -109,7 +109,7 @@
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <EnableUAC>false</EnableUAC>
       <IncrementalLinkDatabaseFile />
-      <AdditionalDependencies>$(CoreLibraryDependencies);%(AdditionalDependencies);libvchan.lib;shlwapi.lib;pathcch.lib;userenv.lib;wtsapi32.lib;version.lib</AdditionalDependencies>
+      <AdditionalDependencies>$(CoreLibraryDependencies);%(AdditionalDependencies);libvchan.lib;shlwapi.lib;pathcch.lib;userenv.lib;wtsapi32.lib;version.lib;bcrypt.lib</AdditionalDependencies>
     </Link>
     <PreBuildEvent>
       <Command>powershell $(QB_SCRIPTS)\local\prebuild.ps1 $(ProjectDir)\..\.. $(QUBES_REPO) &amp;&amp; powershell $(QB_SCRIPTS)\set-version.ps1 $(ProjectDir)\..\..\version $(ProjectDir)\..\..\include\qwt_version.h</Command>
@@ -139,7 +139,7 @@
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <EnableUAC>false</EnableUAC>
       <IncrementalLinkDatabaseFile />
-      <AdditionalDependencies>$(CoreLibraryDependencies);%(AdditionalDependencies);libvchan.lib;shlwapi.lib;pathcch.lib;userenv.lib;wtsapi32.lib;version.lib</AdditionalDependencies>
+      <AdditionalDependencies>$(CoreLibraryDependencies);%(AdditionalDependencies);libvchan.lib;shlwapi.lib;pathcch.lib;userenv.lib;wtsapi32.lib;version.lib;bcrypt.lib</AdditionalDependencies>
     </Link>
     <PreBuildEvent>
       <Command>powershell $(QB_SCRIPTS)\local\prebuild.ps1 $(ProjectDir)\..\.. $(QUBES_REPO) &amp;&amp; powershell $(QB_SCRIPTS)\set-version.ps1 $(ProjectDir)\..\..\version $(ProjectDir)\..\..\include\qwt_version.h</Command>

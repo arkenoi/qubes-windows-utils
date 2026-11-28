@@ -22,6 +22,9 @@
 #include <windows.h>
 #include <stdlib.h>
 #include <strsafe.h>
+#include <sddl.h>
+#include <aclapi.h>
+#include <bcrypt.h>
 
 #include "buffer.h"
 #include "log.h"
@@ -57,7 +60,12 @@ typedef struct _PIPE_SERVER
     DWORD PipeBufferSize;
     DWORD InternalBufferSize;
     DWORD WriteTimeout;
-    PSECURITY_ATTRIBUTES SecurityAttributes;
+    PSECURITY_ATTRIBUTES SecurityAttributes;    // the caller's: the per-client pipes
+    // The MAIN pipe's own descriptor (fix B, PUBLICPIPECREATEINSTANCE), built by QpsCreate when the caller passed
+    // SecurityAttributes, and with it the first-instance flag (QpsMainLoopEx). lpSecurityDescriptor NULL: the server
+    // has none of its own, and its main pipe takes the caller's SecurityAttributes (NULL) as before. Retained with
+    // the server object, which QpsDestroy never frees.
+    SECURITY_ATTRIBUTES MainPipeAttributes;
     LONGLONG NumberClients;
     LONGLONG NextClientId;
     LIST_ENTRY Clients;
@@ -116,11 +124,32 @@ DWORD QpsCreate(
     )
 {
     DWORD Status = ERROR_NOT_ENOUGH_MEMORY;
+    PSECURITY_DESCRIPTOR mainPipeDescriptor = NULL;
 
     LogVerbose("pipe name '%s'", PipeName);
+    // WHO MAY SERVE THE MAIN PIPE (fix B step 1, PUBLICPIPECREATEINSTANCE). A caller that passes a descriptor (the qrexec
+    // agent: exec.c's, which gives Everyone FILE_CREATE_PIPE_INSTANCE) keeps it for the per-client pipes, and the main
+    // pipe gets this one: SYSTEM full control, Everyone FILE_GENERIC_READ - no FILE_WRITE_DATA and no
+    // FILE_CREATE_PIPE_INSTANCE, so no other process can add an instance and take a caller (CreateNamedPipe: "the
+    // user must have FILE_CREATE_PIPE_INSTANCE access to the named pipe object"). The main pipe is PIPE_ACCESS_OUTBOUND
+    // and QpsConnect opens it GENERIC_READ only, so no client loses its connect. Owner SYSTEM, which QpsConnect's
+    // owner check accepts (the agent runs as LocalSystem). A caller that passes none (the qubesdb daemon) keeps the
+    // default descriptor, which already gives Everyone read only, and none of this or of QpsMainLoopEx's first-instance
+    // flag applies to it.
+    if (SecurityAttributes &&
+        !ConvertStringSecurityDescriptorToSecurityDescriptorW(L"O:SYG:SYD:P(A;;FA;;;SY)(A;;FR;;;WD)", SDDL_REVISION_1,
+                                                              &mainPipeDescriptor, NULL))
+    {
+        *Server = NULL;
+        return win_perror("ConvertStringSecurityDescriptorToSecurityDescriptor(main pipe)");
+    }
+
     *Server = malloc(sizeof(struct _PIPE_SERVER));
     if (*Server == NULL)
+    {
+        LocalFree(mainPipeDescriptor);
         goto cleanup;
+    }
 
     ZeroMemory(*Server, sizeof(struct _PIPE_SERVER));
 
@@ -129,6 +158,9 @@ DWORD QpsCreate(
     (*Server)->InternalBufferSize = InternalBufferSize;
     (*Server)->WriteTimeout = WriteTimeout;
     (*Server)->SecurityAttributes = SecurityAttributes;
+    (*Server)->MainPipeAttributes.nLength = sizeof((*Server)->MainPipeAttributes);
+    (*Server)->MainPipeAttributes.bInheritHandle = FALSE;
+    (*Server)->MainPipeAttributes.lpSecurityDescriptor = mainPipeDescriptor;
 
     (*Server)->ConnectCallback = ConnectCallback;
     (*Server)->DisconnectCallback = DisconnectCallback;
@@ -1013,7 +1045,9 @@ static VOID CALLBACK QpsHandshakeClientExited(PVOID context, BOOLEAN timedOut)
     QPS_HANDSHAKE* hs = (QPS_HANDSHAKE*)context;
     HANDLE pipe;
     UNREFERENCED_PARAMETER(timedOut);
-    pipe = CreateFile(hs->PipeName, GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
+    // At anonymous level (fix B, the review of wf_212a17bd-b58): this is a SYSTEM open, and nothing on the other end
+    // is to act as SYSTEM through it. The pipe is this server's own single instance (QpsHandshakeThread).
+    pipe = CreateFile(hs->PipeName, GENERIC_WRITE, 0, NULL, OPEN_EXISTING, SECURITY_SQOS_PRESENT | SECURITY_ANONYMOUS, NULL);
     if (pipe != INVALID_HANDLE_VALUE)
     {
         InterlockedExchange(&hs->ClientGone, 1);
@@ -1028,6 +1062,7 @@ static DWORD WINAPI QpsHandshakeThread(PVOID param)
     DWORD status = ERROR_SUCCESS, cbPipeName, written;
     const WCHAR* step = L"";
     ULONG pid = 0;
+    ULONG nonce[4];
     BOOL connected, left = FALSE;
 
     if (!GetNamedPipeClientProcessId(hs->WritePipe, &pid))
@@ -1037,11 +1072,26 @@ static DWORD WINAPI QpsHandshakeThread(PVOID param)
         goto fail;
     }
     hs->ClientId = QpsAllocateClientId(hs->Server);
-    StringCbPrintf(hs->PipeName, sizeof(hs->PipeName), L"%s-%lu-%lld", hs->Server->PipeName, pid, hs->ClientId);
+    // THIS CLIENT'S PIPE IS THIS SERVER'S ALONE (fix B steps 2 and 3, PUBLICPIPECREATEINSTANCE). Its name ends in 128
+    // random bits, so no process can work it out from the pid and the client counter and create it first; it is
+    // created with FILE_FLAG_FIRST_PIPE_INSTANCE, so a name that does exist already fails here ("creation of the next
+    // instance fails with ERROR_ACCESS_DENIED") and only this client is dropped, with one error line; and with one
+    // instance at most, so nobody - SYSTEM included - adds a second one beside it and reads or rewrites the request.
+    // The two land together: the flag alone on the old predictable name would refuse a client whose pid and number
+    // repeat after a server restart while a stale handle keeps that name. The caller's descriptor (its Everyone ACE)
+    // is unchanged, so every client that opens with GENERIC_WRITE still connects.
+    status = (DWORD)BCryptGenRandom(NULL, (PUCHAR)nonce, sizeof(nonce), BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+    if (!BCRYPT_SUCCESS((NTSTATUS)status))
+    {
+        step = L"BCryptGenRandom(pipe name)";
+        goto fail;
+    }
+    StringCbPrintf(hs->PipeName, sizeof(hs->PipeName), L"%s-%lu-%lld-%08lx%08lx%08lx%08lx", hs->Server->PipeName, pid,
+                   hs->ClientId, nonce[0], nonce[1], nonce[2], nonce[3]);
     readPipe = CreateNamedPipe(hs->PipeName,
-                               PIPE_ACCESS_INBOUND,
+                               PIPE_ACCESS_INBOUND | FILE_FLAG_FIRST_PIPE_INSTANCE,
                                PIPE_TYPE_BYTE | PIPE_WAIT,
-                               PIPE_UNLIMITED_INSTANCES,
+                               1,
                                hs->Server->PipeBufferSize,
                                hs->Server->PipeBufferSize,
                                0,
@@ -1222,26 +1272,44 @@ DWORD QpsMainLoopEx(
     // open then failed at once with "not found" - QpsConnect waits only on ERROR_PIPE_BUSY - and the name was
     // free for another process to take. An instance that is connected and not yet handed on answers
     // ERROR_PIPE_BUSY, so a client waits there, as before.
+    //
+    // A SERVER WITH A MAIN-PIPE DESCRIPTOR OF ITS OWN (QpsCreate, fix B steps 1 and 5: the qrexec agent) creates its
+    // first instance with FILE_FLAG_FIRST_PIPE_INSTANCE. A name that already exists when this loop starts - created by
+    // another process before the server, to take its callers - then fails that create with ERROR_ACCESS_DENIED and the
+    // loop returns, where it could add an instance beside the other one's and share the callers with it. An instance
+    // from an earlier run of this server lives on while a client still holds it ("An instance of a named pipe is always
+    // deleted when the last handle to the instance of the named pipe is closed", CreateNamedPipe); whether such an
+    // instance also fails this create is not documented and not measured - if it does, a restarted server fails the
+    // same way until that client has closed (qrexec-client-vm closes when its read of the main pipe breaks). Later
+    // passes create without the flag, which would refuse them. A server without its own descriptor (the
+    // qubesdb daemon) creates as before: its clients hold their pipes for a connection's life, and its restart is not
+    // to depend on all of them having gone (the review of wf_212a17bd-b58).
+    PSECURITY_ATTRIBUTES mainPipeAttributes =
+        Server->MainPipeAttributes.lpSecurityDescriptor ? &Server->MainPipeAttributes : Server->SecurityAttributes;
+    DWORD firstInstance = Server->MainPipeAttributes.lpSecurityDescriptor ? FILE_FLAG_FIRST_PIPE_INSTANCE : 0;
     while (TRUE)
     {
         writePipe = CreateNamedPipe(Server->PipeName,
-                                    PIPE_ACCESS_OUTBOUND,
+                                    PIPE_ACCESS_OUTBOUND | firstInstance,
                                     PIPE_TYPE_BYTE | PIPE_WAIT,
                                     PIPE_UNLIMITED_INSTANCES,
                                     Server->PipeBufferSize,
                                     Server->PipeBufferSize,
                                     0,
-                                    Server->SecurityAttributes);
+                                    mainPipeAttributes);
         // The one pipe this loop cannot go on without (ADR-qrexec section 3, decision 2). A client connected
         // on the previous pass is still handed to its handshake first, which does not need this loop - as at
         // fbe86fd, where it had been handed on before this create.
         if (writePipe == INVALID_HANDLE_VALUE)
         {
-            status = win_perror("CreateNamedPipe(outbound)");
+            // One line either way; the first names its flag, so error 5 there reads as a name that existed already.
+            status = firstInstance ? win_perror("CreateNamedPipe(outbound, first instance)")
+                                   : win_perror("CreateNamedPipe(outbound)");
             if (connectedPipe != INVALID_HANDLE_VALUE)
                 QpsStartHandshake(Server, connectedPipe);
             return status;
         }
+        firstInstance = 0;
 
         // The pipe's first instance exists here, so a client's open finds it even before the connect
         // below. Told once.
@@ -1488,6 +1556,42 @@ DWORD QpsGetClientToken(
     return status;
 }
 
+// THE SERVER ON THE OTHER END OF A CLIENT'S MAIN-PIPE HANDLE IS LOCALSYSTEM OR AN ADMINISTRATOR (fix B step 4,
+// PUBLICPIPECREATEINSTANCE). Every server of this file runs as LocalSystem: the qrexec agent creates its main pipe owned
+// by SYSTEM (QpsCreate), the qubesdb daemon with the default descriptor, whose owner is its token's default owner.
+// A process that is neither, and holds no SeRestorePrivilege, cannot give an object either owner, so a name it took
+// first is refused here, before this client reads the name it sends or hands it anything. An administrator's process
+// passes only when the pipe it created is owned by Administrators, which its token's default owner decides; that was
+// not measured, for an elevated token or a filtered one. GENERIC_READ
+// carries READ_CONTROL, which reading the owner needs (GetSecurityInfo). One error line on a refusal, with the owner.
+static DWORD QpsServerIsTrusted(
+    IN  HANDLE Pipe,
+    IN  PWCHAR PipeName
+    )
+{
+    PSID owner = NULL;
+    PSECURITY_DESCRIPTOR descriptor = NULL;
+    WCHAR *ownerText = NULL;
+    DWORD status;
+
+    status = GetSecurityInfo(Pipe, SE_KERNEL_OBJECT, OWNER_SECURITY_INFORMATION, &owner, NULL, NULL, NULL, &descriptor);
+    if (status != ERROR_SUCCESS)
+        return win_perror2(status, "reading the owner of the server's pipe");
+    if (owner && (IsWellKnownSid(owner, WinLocalSystemSid) || IsWellKnownSid(owner, WinBuiltinAdministratorsSid)))
+        status = ERROR_SUCCESS;
+    else
+    {
+        if (owner && !ConvertSidToStringSidW(owner, &ownerText))
+            ownerText = NULL;
+        LogError("pipe %s is owned by %s, neither LocalSystem nor Administrators: not connected", PipeName,
+                 ownerText ? ownerText : L"(no owner)");
+        status = ERROR_ACCESS_DENIED;
+    }
+    LocalFree(ownerText);
+    LocalFree(descriptor);
+    return status;
+}
+
 DWORD QpsConnect(
     IN  PWCHAR PipeName,
     OUT HANDLE *ReadPipe,
@@ -1498,8 +1602,13 @@ DWORD QpsConnect(
     WCHAR writePipeName[256];
     DWORD cbWritePipeName;
     DWORD read;
+    size_t cchPipeName;
 
     // Try to open the read pipe; wait for it, if necessary.
+    // AT IDENTIFICATION LEVEL (fix B step 4): this pipe's server only reads which process opened it
+    // (GetNamedPipeClientProcessId) and never acts as its client. A process that took this name first learns who
+    // called, and gets no token it could act with. CreateFile: SECURITY_IDENTIFICATION "Impersonate a client at the
+    // identification level". The client's identity is taken from the per-client pipe below, not from this one.
     do
     {
         LogDebug("opening read pipe: %s", PipeName);
@@ -1508,7 +1617,7 @@ DWORD QpsConnect(
                               0,
                               NULL,
                               OPEN_EXISTING,
-                              0,
+                              SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
                               NULL);
 
         // Exit if an error other than ERROR_PIPE_BUSY occurs.
@@ -1531,25 +1640,50 @@ DWORD QpsConnect(
         }
     } while (*ReadPipe == INVALID_HANDLE_VALUE);
 
+    // A FAILED CONNECT LEAVES NOTHING OPEN AND BOTH HANDLES INVALID_HANDLE_VALUE (fix B step 4, below at `fail`). The
+    // qubesdb client's qdb_open closes read_pipe on a failed connect when it is not INVALID_HANDLE_VALUE
+    // (qubes-core-qubesdb client/qdb-client.c, qdb_open's error label), so a handle closed here and left set would be
+    // closed twice there, and its value may by then name another handle of that process. The two read failures below
+    // closed it and left it set; the invalid-size return left it open.
+
+    // Nothing is read from a server that is not LocalSystem's or an administrator's, and nothing is sent to it.
+    status = QpsServerIsTrusted(*ReadPipe, PipeName);
+    if (status != ERROR_SUCCESS)
+        goto fail;
+
     // Read the second pipe name from the server.
     if (!ReadFile(*ReadPipe, &cbWritePipeName, sizeof(cbWritePipeName), &read, NULL))
     {
-        CloseHandle(*ReadPipe);
-        return win_perror("reading size of write pipe name");
+        status = win_perror("reading size of write pipe name");
+        goto fail;
     }
 
     if (cbWritePipeName > sizeof(writePipeName) - 2 || cbWritePipeName % 2 != 0)
     {
         LogError("invalid pipe name size from server (%u)", cbWritePipeName);
-        return ERROR_INTERNAL_ERROR;
+        status = ERROR_INTERNAL_ERROR;
+        goto fail;
     }
 
     if (!ReadFile(*ReadPipe, writePipeName, cbWritePipeName, &read, NULL))
     {
-        CloseHandle(*ReadPipe);
-        return win_perror("reading write pipe name");
+        status = win_perror("reading write pipe name");
+        goto fail;
     }
-    writePipeName[cbWritePipeName/2] = L'0';
+    writePipeName[cbWritePipeName/2] = L'\0';
+
+    // ONLY A PIPE OF THIS SERVER'S IS OPENED (fix B step 4): the name must be this one's own followed by '-' and contain
+    // no further backslash, as every per-client name the server makes does (QpsHandshakeThread). Any other path -
+    // another pipe, or a file - is not opened with this client's GENERIC_WRITE and token. Pipe names are not case
+    // sensitive (CreateNamedPipe), so neither is the comparison.
+    cchPipeName = wcslen(PipeName);
+    if (_wcsnicmp(writePipeName, PipeName, cchPipeName) != 0 || writePipeName[cchPipeName] != L'-' ||
+        wcschr(writePipeName + cchPipeName, L'\\'))
+    {
+        LogError("the server of %s named a pipe that is not one of its own: not opened", PipeName);
+        status = ERROR_INVALID_DATA;
+        goto fail;
+    }
 
     // Open the write pipe once (AUDIT-qrexec #22). The server creates it before it sends its name,
     // so a pipe that is not found will not appear later: the server has given this client up or
@@ -1573,10 +1707,20 @@ DWORD QpsConnect(
 
     status = GetLastError();
     if (*WritePipe == INVALID_HANDLE_VALUE)
-        return win_perror2(status, "open write pipe");
+    {
+        status = win_perror2(status, "open write pipe");
+        goto fail;
+    }
 
     // The server gets 10 ms to see this connection before the caller's first write.
     Sleep(10);
 
     return ERROR_SUCCESS;
+
+fail:
+    CloseHandle(*ReadPipe);
+    *ReadPipe = INVALID_HANDLE_VALUE;
+    *WritePipe = INVALID_HANDLE_VALUE;      // never opened here: every path to this label is before the open or its failure
+    SetLastError(status);   // qrexec-client-vm reports a failed connect with win_perror, which reads it
+    return status;
 }
