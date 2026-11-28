@@ -97,10 +97,10 @@ typedef void(*QPS_DATA_RECEIVED)(struct _PIPE_SERVER *Server, LONGLONG Id, PVOID
 // WHO MAY SERVE ITS PIPES (fix B, PUBLICPIPECREATEINSTANCE). Each client's own pipe is named
 // "<PipeName>-<pid>-<id>-<32 random hex digits>", is created with FILE_FLAG_FIRST_PIPE_INSTANCE and has one instance at
 // most; it takes SecurityAttributes. A server created WITH SecurityAttributes (the qrexec agent) gives its main pipe a
-// descriptor of its own - owner SYSTEM, SYSTEM full control, Everyone FILE_GENERIC_READ - and serves that pipe only if
-// the pipe its first create joins is owned by LocalSystem or Administrators: QpsMainLoopEx returns ERROR_ACCESS_DENIED
-// at once for a name another process created. One created with NULL (the qubesdb daemon) keeps the default descriptor
-// on its main pipe, and no check.
+// descriptor of its own - owner SYSTEM, SYSTEM full control, Everyone FILE_GENERIC_READ. If that name already exists
+// when the main loop starts, the loop serves it only if it is owned by LocalSystem or Administrators AND carries exactly
+// that descriptor's DACL, protected; otherwise QpsMainLoopEx returns an error at once, ListeningEvent unset. One
+// created with NULL (the qubesdb daemon) keeps the default descriptor on its main pipe, and no check.
 WINDOWSUTILS_API
 DWORD QpsCreate(
     IN  PWCHAR PipeName, // The main pipe's name (the server writes, clients read). Each client's own pipe (it writes, the server reads) is this name with "-<pid>-<id>-<32 hex digits>" appended.
