@@ -180,6 +180,32 @@ PVOID QpsGetClientData(
     IN  LONGLONG ClientId
     );
 
+// Take each client's identity (ADR-qrexec 7.2, CLIENTVMRUNSASSYSTEM fix A). Call once, after QpsCreate and before
+// the main loop; a server that never calls it takes no identity, and QpsGetClientToken answers it ERROR_NOT_SUPPORTED.
+// The identity is that of whoever opened the client's per-client inbound pipe - the pipe its bytes arrive on - and
+// it is taken right after the first read from that pipe completes, before those bytes are handed to QpsRead: the
+// pipe gives a server its client's security context only once data has been read from it (ERROR_CANNOT_IMPERSONATE).
+// So the client must still hold its end at that read; qrexec-client-vm does, until the server disconnects it.
+// A NULL Server is ignored.
+WINDOWSUTILS_API
+void QpsEnableClientTokens(
+    IN  PIPE_SERVER Server
+    );
+
+// The identity taken for a client (QpsEnableClientTokens). ERROR_SUCCESS: *IsLocalSystem says whether the client is
+// LocalSystem; when it is not, *Token is a new handle to a primary token of the client's own, for the caller to
+// close. No token is kept for a LocalSystem client, so none is handed out for one. Any other result means the
+// client has no identity the server can use - it connected below impersonation level, or the server could not
+// impersonate it at its first read - and the caller refuses it; *Token is NULL and *IsLocalSystem FALSE.
+// Valid once QpsRead has returned data for the client: the identity is decided before any of its bytes are queued.
+WINDOWSUTILS_API
+DWORD QpsGetClientToken(
+    IN  PIPE_SERVER Server,
+    IN  LONGLONG ClientId,
+    OUT BOOL *IsLocalSystem,
+    OUT HANDLE *Token
+    );
+
 // Client API: connect to a server.
 WINDOWSUTILS_API
 DWORD QpsConnect(

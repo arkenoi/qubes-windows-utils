@@ -44,6 +44,11 @@ typedef struct _PIPE_CLIENT
     HANDLE WriterThread;
     LONG RefCount;
     PVOID UserData;
+    // The client's identity (QpsEnableClientTokens). Written once, by the reader thread under Lock, before the bytes
+    // of the first read are queued; read under Lock by QpsGetClientToken. ERROR_IO_PENDING until that read.
+    DWORD TokenStatus;
+    BOOL TokenIsLocalSystem;
+    HANDLE Token;           // primary token of a client that is not LocalSystem; NULL otherwise
 } PIPE_CLIENT, *PPIPE_CLIENT;
 
 typedef struct _PIPE_SERVER
@@ -61,6 +66,8 @@ typedef struct _PIPE_SERVER
     // which every function that takes a client id goes through, so a call that arrives after the
     // destroy is answered with "no such client" instead of searching a list that is gone.
     BOOL Destroyed;
+    // Set by QpsEnableClientTokens before the main loop; read-only afterwards.
+    BOOL CaptureClientTokens;
     CRITICAL_SECTION Lock;
 
     PVOID UserContext;
@@ -327,6 +334,8 @@ static void QpsReleaseClient(
         LogDebug("[%lld] freeing client data %p", Client->Id, Client);
         CmqDestroy(Client->ReadBuffer);
         CmqDestroy(Client->WriteBuffer);
+        if (Client->Token)
+            CloseHandle(Client->Token);
 
         DeleteCriticalSection(&Client->Lock);
 
@@ -351,6 +360,77 @@ The ReadFile function returns when one of the following conditions occur:
 That means we can do ReadFile synchronously with a large buffer and not block until
 the whole buffer is read. The read will return once *something* is written to the other end.
 */
+
+// THE CLIENT'S IDENTITY, FROM THE PIPE ITS BYTES CAME IN ON (fix A, ADR-qrexec 7.2). Called by the reader thread right
+// after the first read from a client's inbound pipe completes: ImpersonateNamedPipeClient takes "the security
+// context of the last message read from the pipe", and before any read it fails ERROR_CANNOT_IMPERSONATE ("Unable to
+// impersonate using a named pipe until data has been read from that pipe", System Error Codes 1300-1699). The reader
+// is the only thread doing I/O on that synchronous handle, so the request is not queued behind a blocking read.
+// Nothing else runs on this thread between the impersonation and the revert: no log line, no file I/O. A client
+// below impersonation level is refused (ERROR_BAD_IMPERSONATION_LEVEL), never taken for LocalSystem. A LocalSystem
+// client is only a flag: no token is kept for it, so no SYSTEM token is ever held for a handle value to name.
+static DWORD QpsCaptureClientToken(
+    IN  HANDLE Pipe,
+    OUT BOOL *IsLocalSystem,
+    OUT HANDLE *Primary
+    )
+{
+    HANDLE impersonation = NULL;
+    SECURITY_IMPERSONATION_LEVEL level = SecurityAnonymous;
+    union
+    {
+        TOKEN_USER User;
+        BYTE Buffer[sizeof(TOKEN_USER) + SECURITY_MAX_SID_SIZE];
+    } tokenUser;
+    DWORD status = ERROR_SUCCESS, size;
+
+    *IsLocalSystem = FALSE;
+    *Primary = NULL;
+
+    if (!ImpersonateNamedPipeClient(Pipe))
+        return GetLastError();
+    if (!OpenThreadToken(GetCurrentThread(), TOKEN_QUERY | TOKEN_DUPLICATE, TRUE, &impersonation))
+    {
+        status = GetLastError();
+        impersonation = NULL;
+    }
+    // A thread that cannot stop being its client must not run one more instruction for this server.
+    if (!RevertToSelf())
+        ExitProcess(GetLastError());
+    if (status != ERROR_SUCCESS)
+        return status;
+
+    if (!GetTokenInformation(impersonation, TokenImpersonationLevel, &level, sizeof(level), &size))
+    {
+        status = GetLastError();
+        goto cleanup;
+    }
+    if (level < SecurityImpersonation)
+    {
+        status = ERROR_BAD_IMPERSONATION_LEVEL;
+        goto cleanup;
+    }
+    if (!GetTokenInformation(impersonation, TokenUser, &tokenUser, sizeof(tokenUser), &size))
+    {
+        status = GetLastError();
+        goto cleanup;
+    }
+    if (IsWellKnownSid(tokenUser.User.User.Sid, WinLocalSystemSid))
+    {
+        *IsLocalSystem = TRUE;
+        goto cleanup;
+    }
+    if (!DuplicateTokenEx(impersonation, TOKEN_ALL_ACCESS, NULL, SecurityImpersonation, TokenPrimary, Primary))
+    {
+        status = GetLastError();
+        *Primary = NULL;
+    }
+
+cleanup:
+    CloseHandle(impersonation);
+    return status;
+}
+
 static DWORD WINAPI QpsReaderThread(
     PVOID Param
     )
@@ -469,6 +549,24 @@ static DWORD WINAPI QpsReaderThread(
             free(param);
             free(buffer);
             return 1;
+        }
+
+        // The first read decides who the client is (QpsCaptureClientToken), and that is recorded BEFORE its bytes are
+        // queued below, so a host whose QpsRead returned data never finds the identity undecided. Only this thread
+        // writes these fields. A failed capture leaves the client with no identity; the host refuses it.
+        if (server->CaptureClientTokens && client->TokenStatus == ERROR_IO_PENDING)
+        {
+            BOOL isLocalSystem = FALSE;
+            HANDLE token = NULL;
+            DWORD tokenStatus = QpsCaptureClientToken(pipe, &isLocalSystem, &token);
+
+            EnterCriticalSection(&client->Lock);
+            client->TokenIsLocalSystem = isLocalSystem;
+            client->Token = token;
+            client->TokenStatus = tokenStatus;
+            LeaveCriticalSection(&client->Lock);
+            if (tokenStatus != ERROR_SUCCESS)
+                LogDebug("[%lld] no identity from the first read (%lu)", client->Id, tokenStatus);
         }
 
         // we have some data from the pipe, add it to the read buffer
@@ -631,6 +729,8 @@ static DWORD QpsConnectClient(
     client->WritePipe = WritePipe;
     client->ReadPipe = ReadPipe;
     client->Disconnecting = FALSE;
+    // Decided at the first read when the server takes identities; never decided, and so refused, when it does not.
+    client->TokenStatus = Server->CaptureClientTokens ? ERROR_IO_PENDING : ERROR_NOT_SUPPORTED;
     InitializeCriticalSection(&client->Lock);
 
     client->ReadBuffer = CmqCreate(Server->InternalBufferSize);
@@ -1340,6 +1440,51 @@ PVOID QpsGetClientData(
     LeaveCriticalSection(&client->Lock);
     QpsReleaseClient(Server, client);
     return data;
+}
+
+void QpsEnableClientTokens(
+    IN  PIPE_SERVER Server
+    )
+{
+    if (Server)
+        Server->CaptureClientTokens = TRUE;
+}
+
+DWORD QpsGetClientToken(
+    IN  PIPE_SERVER Server,
+    IN  LONGLONG ClientId,
+    OUT BOOL *IsLocalSystem,
+    OUT HANDLE *Token
+    )
+{
+    PPIPE_CLIENT client;
+    DWORD status;
+
+    *IsLocalSystem = FALSE;
+    *Token = NULL;
+    if (!Server->CaptureClientTokens)
+        return ERROR_NOT_SUPPORTED;
+    client = QpsGetClient(Server, ClientId);
+    if (!client)
+        return ERROR_NOT_CONNECTED;
+
+    EnterCriticalSection(&client->Lock);
+    status = client->TokenStatus;
+    if (status == ERROR_SUCCESS)
+    {
+        // A new handle, so the client's own is still closed with the client and the caller's lives as long as it needs.
+        if (client->Token &&
+            !DuplicateHandle(GetCurrentProcess(), client->Token, GetCurrentProcess(), Token, 0, FALSE, DUPLICATE_SAME_ACCESS))
+        {
+            status = GetLastError();
+            *Token = NULL;
+        }
+        else
+            *IsLocalSystem = client->TokenIsLocalSystem;
+    }
+    LeaveCriticalSection(&client->Lock);
+    QpsReleaseClient(Server, client);
+    return status;
 }
 
 DWORD QpsConnect(
