@@ -98,8 +98,8 @@ typedef void(*QPS_DATA_RECEIVED)(struct _PIPE_SERVER *Server, LONGLONG Id, PVOID
 // "<PipeName>-<pid>-<id>-<32 random hex digits>", is created with FILE_FLAG_FIRST_PIPE_INSTANCE and has one instance at
 // most; it takes SecurityAttributes. A server created WITH SecurityAttributes (the qrexec agent) gives its main pipe a
 // descriptor of its own - owner SYSTEM, SYSTEM full control, Everyone FILE_GENERIC_READ. If that name already exists
-// when the main loop starts, the loop serves it only if it is owned by LocalSystem or Administrators AND carries exactly
-// that descriptor's DACL, protected; otherwise QpsMainLoopEx returns an error at once, ListeningEvent unset. One
+// when the main loop starts, the loop serves it only if it is owned by LocalSystem or Administrators AND its DACL lets no
+// other SID add an instance or change the DACL or owner; otherwise QpsMainLoopEx returns an error at once, ListeningEvent unset. One
 // created with NULL (the qubesdb daemon) keeps the default descriptor on its main pipe, and no check.
 WINDOWSUTILS_API
 DWORD QpsCreate(
@@ -216,7 +216,8 @@ DWORD QpsGetClientToken(
 // Client API: connect to a server. The per-client pipe is opened with SECURITY_SQOS_PRESENT | SECURITY_IMPERSONATION:
 // impersonation level, static tracking (the opener's identity, taken at the open), not effective-only (the whole token).
 // Before that (fix B): the main pipe is opened at identification level; a main pipe whose owner is neither LocalSystem
-// nor Administrators is refused (ERROR_ACCESS_DENIED); a per-client name that is not "<PipeName>-..." with no further
+// nor Administrators, or - for \\.\pipe\qrexec_trigger only - whose DACL lets another SID add an instance or change
+// the DACL or owner, is refused (ERROR_ACCESS_DENIED), and so is a per-client pipe with such an owner; a per-client name that is not "<PipeName>-..." with no further
 // backslash is refused (ERROR_INVALID_DATA). On any failure nothing is left open and both handles are
 // INVALID_HANDLE_VALUE, and the result is also the thread's last error.
 WINDOWSUTILS_API
