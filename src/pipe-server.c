@@ -1291,7 +1291,8 @@ DWORD QpsMainLoopEx(
     // A SERVER WITH A MAIN-PIPE DESCRIPTOR OF ITS OWN (QpsCreate, fix B steps 1 and 5: the qrexec agent) SERVES ONLY A
     // PIPE THAT CARRIES THAT DESCRIPTOR'S DACL. Its first create asks FILE_FLAG_FIRST_PIPE_INSTANCE. If that succeeds the
     // pipe is new, and "If a new named pipe is being created, the access control list (ACL) from the security attributes
-    // parameter defines the discretionary access control for the named pipe" (CreateNamedPipe): nothing to check.
+    // parameter defines the discretionary access control for the named pipe" (CreateNamedPipe). Its DACL is still read
+    // back once against the property below (QpsPipeDaclAdminOnly), because every client tests it at connect.
     // If it fails with ERROR_ACCESS_DENIED the name exists - a leftover whose last handle another process still holds:
     // "The pipe exists as long as a server or client process has an open handle to the pipe" (DisconnectNamedPipe).
     // The server then joins it without the flag (refusing at once is what the Opus audit of bc7c7df refuted, Finding 1:
@@ -1366,7 +1367,19 @@ DWORD QpsMainLoopEx(
             LogInfo("pipe %s existed, held by another handle: joined, its owner and DACL pass", Server->PipeName);
         }
         else if (checkOwner)
+        {
+            // A NEW PIPE IS READ BACK TOO (audit of 880cd16, A2). Every client tests this DACL at connect
+            // (QpsConnect); if what the pipe stores ever differs from the descriptor (an inherited or added ACE),
+            // the failure is here, once, loudly - not "created new" followed by every call refused.
+            status = QpsPipeDaclAdminOnly(writePipe, Server->PipeName,
+                                          L"not served: the new pipe does not store this server's descriptor's DACL");
+            if (status != ERROR_SUCCESS)
+            {
+                CloseHandle(writePipe);
+                return status;
+            }
             LogInfo("pipe %s created new, with this server's own descriptor", Server->PipeName);
+        }
         // One of the two lines above, or the refusal's error line, tells which way the first pass went.
         checkOwner = FALSE;
 
@@ -1662,9 +1675,11 @@ static DWORD QpsServerIsTrusted(
 // are skipped; an allow ACE of another layout (object, callback object) is judged by its mask alone, as if its SID were
 // foreign. SE_DACL_PROTECTED is not required: it changes no access on a pipe. Read with GetSecurityInfo on the caller's
 // own handle - FILE_GENERIC_READ and FILE_GENERIC_WRITE each include "read the pipe's DACL" (Named Pipe Security and
-// Access Rights). Passes: fix B's main-pipe DACL (SYSTEM FA, Everyone FR) and the default one the qubesdb daemon gets,
-// "full control to the LocalSystem account, administrators, and the creator owner ... read access to members of the
-// Everyone group and the anonymous account" (same page). Fails: exec.c's DACL of an agent before fix B (Everyone
+// Access Rights). Passes, as written: fix B's main-pipe DACL (SYSTEM FA, Everyone FR) - as stored on a guest, NOT YET
+// READ. The default DACL the qubesdb daemon gets is described as "full control to the LocalSystem account,
+// administrators, and the creator owner ... read access to members of the Everyone group and the anonymous account"
+// (same page), which would pass if "the creator owner" resolves to SYSTEM or Administrators - UNMEASURED, and the
+// reason QpsConnect applies this to the trigger pipe only. Fails: exec.c's DACL of an agent before fix B (Everyone
 // FILE_CREATE_PIPE_INSTANCE). A failure is one error line with the SDDL that was read, ending in Refused.
 static DWORD QpsPipeDaclAdminOnly(
     IN  HANDLE Pipe,

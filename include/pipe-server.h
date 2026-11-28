@@ -99,7 +99,8 @@ typedef void(*QPS_DATA_RECEIVED)(struct _PIPE_SERVER *Server, LONGLONG Id, PVOID
 // most; it takes SecurityAttributes. A server created WITH SecurityAttributes (the qrexec agent) gives its main pipe a
 // descriptor of its own - owner SYSTEM, SYSTEM full control, Everyone FILE_GENERIC_READ. If that name already exists
 // when the main loop starts, the loop serves it only if it is owned by LocalSystem or Administrators AND its DACL lets no
-// other SID add an instance or change the DACL or owner; otherwise QpsMainLoopEx returns an error at once, ListeningEvent unset. One
+// other SID add an instance or change the DACL or owner; a name it creates new is read back against that DACL test too.
+// Otherwise QpsMainLoopEx returns an error at once, ListeningEvent unset. One
 // created with NULL (the qubesdb daemon) keeps the default descriptor on its main pipe, and no check.
 WINDOWSUTILS_API
 DWORD QpsCreate(
